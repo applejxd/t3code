@@ -1,3 +1,21 @@
+> **This is a fork.** [applejxd](https://github.com/applejxd)'s fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code). It keeps Pi's `pi-background` (`bg_run`) jobs alive instead of letting the idle release stop them, and lets a Pi session stay pinned for up to 7 days while background work runs. Everything below this notice is the upstream README, and its install commands install the **upstream** build.
+>
+> **Install this fork (CLI):**
+>
+> macOS / Linux:
+>
+> ```bash
+> curl -fsSL https://applejxd.github.io/t3code/install.sh | sh
+> ```
+>
+> Windows (PowerShell):
+>
+> ```powershell
+> irm https://applejxd.github.io/t3code/install.ps1 | iex
+> ```
+>
+> Windows desktop app: download `T3-Code-<version>-x64.exe` from [this fork's Releases](https://github.com/applejxd/t3code/releases).
+
 <p align="center">
   <a href="https://t3.codes">
     <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
