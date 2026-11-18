@@ -7,7 +7,8 @@
 # Environment:
 #   T3CODE_CHANNEL           release train to follow: stable, nightly, or preview
 #                            (default: stable; preview is a maintainers' test train)
-#   T3CODE_VERSION           exact version to install (overrides T3CODE_CHANNEL)
+#   T3CODE_VERSION           exact version to install, plain (1.2.3) or fork (1.2.3-fork.4)
+#                            (overrides T3CODE_CHANNEL)
 #   T3CODE_HOME              T3 home directory (default: ~/.t3)
 #   T3CODE_INSTALL_BIN_DIR   where the `t3` command goes (default: ~/.local/bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
@@ -192,10 +193,25 @@ if [ -z "$version" ]; then
   esac
   tmp_index="$(mktemp)"
   if [ "$channel" = stable ]; then
-    # release.yml marks only plain stable releases latest. This is a github.com
-    # page, so it is not cut off by a page of newer nightlies or the API quota.
-    fetch "https://github.com/${repo}/releases/latest" "$tmp_index" application/json
-    version="$(sed -n "s/.*\"tag_name\": *\"${tag_pattern}\".*/\1/p" "$tmp_index" | head -n 1)"
+    # Fork releases are vX.Y.Z-fork.N. /releases/latest only names the newest one published, which
+    # a hotfix on an older base can outrank, so rank the whole list: base version, then N.
+    : > "${tmp_index}.forks"
+    page=1
+    while [ "$page" -le 10 ]; do
+      fetch "https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}" "$tmp_index"
+      sed -n 's/.*"tag_name": *"v\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)-fork\.\([0-9][0-9]*\)".*/\1 \2 \3 \4 \1.\2.\3-fork.\4/p' "$tmp_index" >> "${tmp_index}.forks"
+      # A short page is the last one.
+      [ "$(grep -c '"tag_name"' "$tmp_index")" -ge 100 ] || break
+      page=$((page + 1))
+    done
+    version="$(sort -k1,1nr -k2,2nr -k3,3nr -k4,4nr "${tmp_index}.forks" | head -n 1 | cut -d' ' -f5)"
+    rm -f "${tmp_index}.forks"
+    if [ -z "$version" ]; then
+      # No fork release: fall back to a plain stable one. This is a github.com page, so it is not
+      # cut off by a page of newer nightlies or the API quota.
+      fetch "https://github.com/${repo}/releases/latest" "$tmp_index" application/json
+      version="$(sed -n "s/.*\"tag_name\": *\"${tag_pattern}\".*/\1/p" "$tmp_index" | head -n 1)"
+    fi
   else
     page=1
     while [ -z "$version" ] && [ "$page" -le 10 ]; do

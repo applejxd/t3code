@@ -6,7 +6,8 @@
 # Environment:
 #   T3CODE_CHANNEL           release train to follow: stable, nightly, or preview
 #                            (default: stable; preview is a maintainers' test train)
-#   T3CODE_VERSION           exact version to install (overrides T3CODE_CHANNEL)
+#   T3CODE_VERSION           exact version to install, plain (1.2.3) or fork (1.2.3-fork.4)
+#                            (overrides T3CODE_CHANNEL)
 #   T3CODE_HOME              T3 home directory (default: ~\.t3)
 #   T3CODE_INSTALL_BIN_DIR   where t3.exe is linked (default: ~\.local\bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
@@ -154,10 +155,25 @@ if (-not $version) {
     default { Fail "T3CODE_CHANNEL must be stable, nightly, or preview" }
   }
   if ($channel -eq "stable") {
-    # release.yml marks only plain stable releases latest. This is a github.com
-    # page, so it is not cut off by a page of newer nightlies or the API quota.
-    $release = Invoke-Retrying { Invoke-RestMethod -Uri "https://github.com/$repo/releases/latest" -Headers @{ "User-Agent" = "t3-install"; "Accept" = "application/json" } }
-    $tag = ($release | Where-Object { $_.tag_name -match $tagPattern }).tag_name
+    # Fork releases are vX.Y.Z-fork.N. /releases/latest only names the newest one published, which
+    # a hotfix on an older base can outrank, so rank the whole list: base version, then N.
+    $forkPattern = '^v(\d+\.\d+\.\d+)-fork\.(\d+)$'
+    $forkTags = @()
+    for ($page = 1; $page -le 10; $page++) {
+      $releases = Invoke-Retrying { Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100&page=$page" -Headers @{ "User-Agent" = "t3-install" } }
+      if (-not $releases) { break }
+      $forkTags += @($releases | Where-Object { -not $_.draft -and $_.tag_name -match $forkPattern } | ForEach-Object { $_.tag_name })
+      # A short page is the last one.
+      if (@($releases).Count -lt 100) { break }
+    }
+    # A four-part System.Version (1.10.0.4) compares each part as a number.
+    $tag = $forkTags | Sort-Object { [version]($_ -replace $forkPattern, '$1.$2') } -Descending | Select-Object -First 1
+    if (-not $tag) {
+      # No fork release: fall back to a plain stable one. This is a github.com page, so it is not
+      # cut off by a page of newer nightlies or the API quota.
+      $release = Invoke-Retrying { Invoke-RestMethod -Uri "https://github.com/$repo/releases/latest" -Headers @{ "User-Agent" = "t3-install"; "Accept" = "application/json" } }
+      $tag = ($release | Where-Object { $_.tag_name -match $tagPattern }).tag_name
+    }
   } else {
     $tag = $null
     for ($page = 1; -not $tag -and $page -le 10; $page++) {
