@@ -10,10 +10,28 @@ name: Release (fork)
 #     and the SHA256SUMS file both installers verify against;
 #   - the Windows x64 desktop installer, with its updater manifest (latest.yml).
 #
-# Versioning: push a plain `vX.Y.Z` tag. install.sh's default (stable) flow reads
-# /releases/latest and only accepts a tag matching exactly v<n>.<n>.<n>, so a
-# suffixed tag (v0.2.0-fork.1) would never be found. Pick a version upstream
-# has not tagged: a tag already fetched from upstream cannot be reused here.
+# Versioning: push a `v<base>-fork.<n>` tag, for example v0.1.10-fork.1, where
+# <base> is the upstream x.y.z the build is based on and <n> counts this fork's
+# releases of it. Upstream tags plain vX.Y.Z and only the -nightly. and
+# -preview. suffixes, so a -fork. tag can never collide with a tag fetched from
+# upstream, whatever upstream releases next. scripts/install.sh and install.ps1
+# pick the newest fork release by base version, then <n>, and use a plain vX.Y.Z
+# release only when there is no fork release. `t3 update` and the mobile update
+# check rank the same way (packages/shared/src/cliRelease.ts) and never offer a
+# plain release of the running build's base or older. The desktop app's feed is
+# this repository too: its publish config takes GITHUB_REPOSITORY at build time
+# (scripts/build-desktop-artifact.ts), and electron-updater orders by semver.
+#
+# The full fork version (0.1.10-fork.1) is used unchanged for everything built;
+# nothing strips the suffix:
+#   - The installers derive the archive name from the tag, as
+#     t3-<version>-<platform>-<arch>, so the archives must carry it.
+#   - It is valid semver, as nightly versions already are for electron-builder
+#     and the CLI archive builder, and the updater orders it by <n>.
+#   - latest.yml carries the app's own version, so it matches what the desktop
+#     app compares against. electron-builder would name the feed after the
+#     version's prerelease label (fork.yml) only for generic and S3 feeds; for
+#     the GitHub provider the desktop build uses, it stays latest.yml.
 #
 # T3 Connect: builds bake the public Clerk and relay identifiers from
 # .env.example, which point at upstream's production relay (as upstream's own
@@ -30,12 +48,12 @@ name: Release (fork)
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-fork.[0-9]+"
   # The file must be on the default branch for the Run workflow button to exist.
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the v (for example 0.2.0). Builds the selected branch or tag."
+        description: "Full fork version to release, without the v (for example 0.1.10-fork.1). Builds the selected branch or tag."
         required: true
         type: string
       draft:
@@ -92,9 +110,10 @@ jobs:
             draft=false
           fi
           version="${raw#v}"
-          # Plain x.y.z only: install.sh's stable lookup rejects any suffix.
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release version must be plain x.y.z (got '$raw'); install.sh cannot find suffixed stable tags."
+          # x.y.z-fork.n only: the installers look for exactly this form, and it
+          # cannot collide with an upstream tag.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$ ]]; then
+            echo "::error::Release version must look like x.y.z-fork.n, for example 0.1.10-fork.1 (got '$raw')."
             exit 1
           fi
           tag="v$version"

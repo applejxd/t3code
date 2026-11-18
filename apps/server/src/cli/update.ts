@@ -2,6 +2,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   CLI_RELEASE_BASE_URL_ENV,
   CLI_RELEASE_CHANNELS,
+  CLI_RELEASE_INDEX_PAGE_SIZE,
   cliReleaseIndexPageUrl,
   cliReleaseChannelOf,
   newestCliReleaseVersion,
@@ -72,6 +73,7 @@ export const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(funct
   const httpClient = yield* HttpClient.HttpClient;
   const environment = yield* HostProcess.Environment;
   const githubToken = environment.GH_TOKEN?.trim() || environment.GITHUB_TOKEN?.trim() || undefined;
+  const listed: Array<(typeof ReleaseIndex.Type)[number]> = [];
   for (let page = 1; page <= RELEASE_INDEX_MAX_PAGES; page += 1) {
     const request = HttpClientRequest.get(cliReleaseIndexPageUrl(page)).pipe(
       HttpClientRequest.setHeader("Accept", "application/vnd.github+json"),
@@ -94,10 +96,13 @@ export const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(funct
         () => new CliUpdateError({ reason: "The t3 release index had an unexpected shape." }),
       ),
     );
-    const version = newestCliReleaseVersion(releases, channel);
-    if (version !== undefined) return version;
-    if (releases.length === 0) break;
+    listed.push(...releases);
+    // Stable ranks fork releases across the whole list, so only the other channels stop at a match.
+    if (channel !== "stable" && newestCliReleaseVersion(listed, channel) !== undefined) break;
+    if (releases.length < CLI_RELEASE_INDEX_PAGE_SIZE) break;
   }
+  const version = newestCliReleaseVersion(listed, channel);
+  if (version !== undefined) return version;
   return yield* new CliUpdateError({ reason: `No published ${channel} release was found.` });
 });
 

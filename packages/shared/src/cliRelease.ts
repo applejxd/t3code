@@ -3,7 +3,8 @@ import * as Schema from "effect/Schema";
 
 import { compareSemverVersions } from "./semver.ts";
 
-const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
+// The fork's releases (release-fork.yml), which scripts/install.sh and install.ps1 also read.
+const CLI_RELEASE_REPOSITORY = "applejxd/t3code";
 export const CLI_RELEASES_PAGE_URL = `https://github.com/${CLI_RELEASE_REPOSITORY}/releases`;
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
@@ -85,6 +86,30 @@ export const CLI_RELEASE_CHANNELS: ReadonlyArray<CliReleaseChannel> = [
   "preview",
 ];
 
+const FORK_VERSION = /^(\d+\.\d+\.\d+)-fork\.\d+$/;
+
+/** A fork release is `<base>-fork.<n>`: this fork's n-th release of upstream's `x.y.z`. */
+function forkReleaseBase(version: string): string | undefined {
+  return FORK_VERSION.exec(version)?.[1];
+}
+
+function isForkVersion(version: string): boolean {
+  return FORK_VERSION.test(version);
+}
+
+/**
+ * Orders release versions the way the installers pick one: a fork release ranks above the plain
+ * release of its base, then by number, and below any later base. Semver alone reads
+ * `1.2.3-fork.1` as a prerelease, below `1.2.3`, so only that pair differs from it.
+ */
+export function compareCliReleaseVersions(left: string, right: string): number {
+  const leftBase = forkReleaseBase(left);
+  if (leftBase !== undefined && compareSemverVersions(leftBase, right) === 0) return 1;
+  const rightBase = forkReleaseBase(right);
+  if (rightBase !== undefined && compareSemverVersions(left, rightBase) === 0) return -1;
+  return compareSemverVersions(left, right);
+}
+
 export function cliReleaseChannelOf(version: string): CliReleaseChannel {
   const channel = /^[^-+]+-(nightly|preview)\.\d{8}\.\d+$/.exec(version)?.[1];
   return channel === "nightly" || channel === "preview" ? channel : "stable";
@@ -131,12 +156,21 @@ export function acceptsTrackSwitchRelease(
   );
 }
 
-/** Page until the channel matches; nightlies can push preview/stable releases past the first page. */
+export const CLI_RELEASE_INDEX_PAGE_SIZE = 100;
+
+/**
+ * Page until the channel matches; nightlies can push preview/stable releases past the first page.
+ * Stable reads every page, since a fork release on an older base can sit behind newer ones.
+ */
 export function cliReleaseIndexPageUrl(page: number): string {
-  return `https://api.github.com/repos/${CLI_RELEASE_REPOSITORY}/releases?per_page=100&page=${page}`;
+  return `https://api.github.com/repos/${CLI_RELEASE_REPOSITORY}/releases?per_page=${CLI_RELEASE_INDEX_PAGE_SIZE}&page=${page}`;
 }
 
-/** Draft assets are not downloadable. */
+/**
+ * Stable takes the newest fork release (highest base, then number) and only without one the
+ * first plain release, as scripts/install.sh does. Other channels take the first match.
+ * Draft assets are not downloadable.
+ */
 export function newestCliReleaseVersion(
   releases: ReadonlyArray<{
     readonly tag_name: string;
@@ -144,13 +178,25 @@ export function newestCliReleaseVersion(
   }>,
   channel: CliReleaseChannel,
 ): string | undefined {
+  const versions: string[] = [];
   for (const release of releases) {
     if (release.draft) continue;
     const version = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(release.tag_name)?.[1];
-    if (version === undefined) continue;
-    if (cliReleaseChannelOf(version) === channel) return version;
+    if (version !== undefined) versions.push(version);
   }
-  return undefined;
+  if (channel === "stable") {
+    let newestFork: string | undefined;
+    for (const version of versions) {
+      if (
+        isForkVersion(version) &&
+        (newestFork === undefined || compareCliReleaseVersions(version, newestFork) > 0)
+      ) {
+        newestFork = version;
+      }
+    }
+    if (newestFork !== undefined) return newestFork;
+  }
+  return versions.find((version) => cliReleaseChannelOf(version) === channel);
 }
 
 const NpmReleaseMigrationManifest = Schema.Struct({
