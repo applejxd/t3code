@@ -83,7 +83,8 @@ Jobs started by the [pi-background](https://www.npmjs.com/package/pi-background)
 The thread shows them as background work, and a finished job wakes the same thread. Pi ends its
 jobs when it exits, so Stop, settling or archiving the thread, and restarting T3 Code still end
 them. Changes that restart Pi, such as a different permission mode, are refused until the jobs
-finish or you press Stop. A job that runs for several hours with no Pi activity is also released.
+finish or you press Stop. A job that runs for more than 7 days with no Pi activity is also
+released; time the computer spends asleep counts toward that limit.
 This follows pi-background 0.4.x output; other extensions' background work stops with the idle
 session as before.
 

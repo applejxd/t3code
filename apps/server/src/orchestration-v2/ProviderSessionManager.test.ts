@@ -458,6 +458,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly backgroundTasksEndWithProcess?: boolean;
+    readonly maxIdlePinMs?: number;
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
     readonly interruptTurn?: Effect.Effect<void>;
@@ -562,6 +563,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
           ...(options.backgroundTasksEndWithProcess === false
             ? {}
             : { backgroundTasksEndWithProcess: true as const }),
+          ...(options.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: options.maxIdlePinMs }),
           ...(options.hasPendingBackgroundWork === undefined
             ? {}
             : { hasPendingBackgroundWork: options.hasPendingBackgroundWork }),
@@ -640,6 +642,8 @@ function layerTest(input: {
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly backgroundTasksEndWithProcess?: boolean;
+  /** The runtime's own pin cap; `maxIdlePinMs` above is the manager's default. */
+  readonly runtimeMaxIdlePinMs?: number;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
   readonly interruptTurn?: Effect.Effect<void>;
@@ -686,6 +690,9 @@ function layerTest(input: {
       ...(input.backgroundTasksEndWithProcess === undefined
         ? {}
         : { backgroundTasksEndWithProcess: input.backgroundTasksEndWithProcess }),
+      ...(input.runtimeMaxIdlePinMs === undefined
+        ? {}
+        : { maxIdlePinMs: input.runtimeMaxIdlePinMs }),
       ...(input.hangSessionScopeClose === undefined
         ? {}
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
@@ -3719,6 +3726,47 @@ it.effect("ProviderSessionManagerV2 keeps provider updates that land while relea
       ),
     );
   }),
+);
+
+it.effect.each([
+  { declared: undefined, liveUntilMs: 3_000 },
+  { declared: 10_000, liveUntilMs: 10_000 },
+] as const)(
+  "ProviderSessionManagerV2 releases a session pinned by background work once its pin cap passes (runtime cap $declared)",
+  ({ declared, liveUntilMs }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-pin-cap");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+
+        // The first idle check at 1 s starts the pin; the cap counts from there.
+        yield* TestClock.adjust(liveUntilMs);
+        assert.isTrue(yield* manager.isLive(providerSessionId));
+        yield* TestClock.adjust("1 second");
+        assert.isFalse(yield* manager.isLive(providerSessionId));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1_000,
+            maxIdlePinMs: 3_000,
+            hasPendingBackgroundWork: Effect.succeed(true),
+            ...(declared === undefined ? {} : { runtimeMaxIdlePinMs: declared }),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect(

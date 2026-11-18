@@ -717,6 +717,12 @@ export interface ProviderAdapterV2SessionRuntime {
    * must keep Waiting.
    */
   readonly backgroundTasksEndWithProcess?: true;
+  /**
+   * How long the manager keeps this session open for pending background work after the provider
+   * last reported activity. Unset uses the manager default; set it for work that runs silently
+   * for longer.
+   */
+  readonly maxIdlePinMs?: number;
   readonly getModelContextWindow?: (
     modelSelection: ModelSelection,
     cwd?: string | null,

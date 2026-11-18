@@ -865,6 +865,8 @@ describe("PiAdapterV2", () => {
       assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
       assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
       assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(otherThread));
+      // Jobs can run silently through a holiday; the manager's 4 h default would end them.
+      assert.equal(runtime.maxIdlePinMs, 7 * 24 * 60 * 60 * 1000);
 
       yield* fake.emit({
         type: "tool_execution_start",

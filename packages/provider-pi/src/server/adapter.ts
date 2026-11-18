@@ -95,6 +95,8 @@ const PI_REQUEST_TIMEOUT_MS = 15_000;
 const PI_SUBAGENT_ASYNC_PREFIX = "PI_SUBAGENT_ASYNC_JSON:";
 const decodePiJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const PI_SESSION_TIMEOUT_MS = 60_000;
+// pi-background jobs (training runs, builds) stay silent for days; the manager default is 4 h.
+const PI_MAX_IDLE_PIN_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_EXTENSION_STATUSES = 32;
 const MAX_EXTENSION_STATUS_KEY_LENGTH = 256;
 const MAX_EXTENSION_STATUS_TEXT_LENGTH = 4096;
@@ -3289,6 +3291,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               (backgroundJobs.size > 0 && threadState?.providerThread.id === providerThread.id),
           ),
         backgroundTasksEndWithProcess: true,
+        maxIdlePinMs: PI_MAX_IDLE_PIN_MS,
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
