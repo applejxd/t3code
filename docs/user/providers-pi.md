@@ -76,6 +76,17 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
+## Background Jobs
+
+Jobs started by the [pi-background](https://www.npmjs.com/package/pi-background) extension
+(`bg_run`, or a long `bash` command it moves to the background) stay alive while the thread is idle.
+The thread shows them as background work, and a finished job wakes the same thread. Pi ends its
+jobs when it exits, so Stop, settling or archiving the thread, and restarting T3 Code still end
+them. Changes that restart Pi, such as a different permission mode, are refused until the jobs
+finish or you press Stop. A job that runs for several hours with no Pi activity is also released.
+This follows pi-background 0.4.x output; other extensions' background work stops with the idle
+session as before.
+
 ## Troubleshooting
 
 - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh

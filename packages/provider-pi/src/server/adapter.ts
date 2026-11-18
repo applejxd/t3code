@@ -10,6 +10,7 @@ import {
   type ChatAttachment,
   type ModelSelection,
   type OrchestrationV2ExecutionNode,
+  type OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   type OrchestrationV2ProviderRef,
@@ -97,6 +98,12 @@ const PI_SESSION_TIMEOUT_MS = 60_000;
 const MAX_EXTENSION_STATUSES = 32;
 const MAX_EXTENSION_STATUS_KEY_LENGTH = 256;
 const MAX_EXTENSION_STATUS_TEXT_LENGTH = 4096;
+const MAX_BACKGROUND_JOB_DESCRIPTION_LENGTH = 200;
+// pi-background 0.4.x: a long bash call's handoff result, and the headline of a job's exit message.
+const PI_BG_JOB_ID = /^bg\d+$/;
+const PI_BG_HANDOFF_STARTED =
+  /^Still running after [^,]+, so it moved to the background as (bg\d+)\./;
+const PI_BG_JOB_FINISHED = /^(bg\d+) (?:exited|failed|killed)\b/;
 const PI_UNSOLICITED_ACTIVITY_ERROR =
   "Pi started agent work outside an active T3 turn. The session was stopped to prevent invisible tool execution.";
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
@@ -624,6 +631,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       // Turn failures can leave Pi alive; pump termination retires the runtime.
       let runtimeRetired = false;
       let pendingWake: PiWake | null = null;
+      // pi-background jobs end with the Pi process, so they pin the session until it stops.
+      const backgroundJobs = new Map<string, OrchestrationV2PendingBackgroundTask>();
+      // Outlives threadState across a session switch, which must still empty the old roster.
+      let backgroundRosterThread: PiThreadState | null = null;
       let extensionStatusReset: {
         previous: NonNullable<OrchestrationV2ProviderSession["extensionStatuses"]>;
         readonly touched: Set<string>;
@@ -642,6 +653,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         Effect.gen(function* () {
           closed = true;
           sessionEntity = { ...sessionEntity, extensionStatuses: [] };
+          backgroundJobs.clear();
           pendingWake = null;
           if (pendingPromptResponsesDrained !== null)
             yield* Deferred.fail(
@@ -736,14 +748,14 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           lastError: string | null = sessionEntity.lastError,
         ) {
           const updatedAt = yield* DateTime.now;
+          const ended = status === "stopped" || runtimeRetired || unsolicitedActivityDetected;
+          if (ended) backgroundJobs.clear();
           sessionEntity = {
             ...sessionEntity,
             status,
             lastError,
             updatedAt,
-            ...(status === "stopped" || runtimeRetired || unsolicitedActivityDetected
-              ? { extensionStatuses: [] }
-              : {}),
+            ...(ended ? { extensionStatuses: [] } : {}),
           };
           yield* emit({
             type: "provider_session.updated",
@@ -803,6 +815,51 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         yield* updateProviderSession(sessionEntity.status);
       });
 
+      // Called by the event pump, not handleSessionEvent, so replayed wake events count once.
+      const observeBackgroundJobs = (event: PiRpcRecord): boolean => {
+        if (closed || stopRequested || runtimeRetired || unsolicitedActivityDetected) return false;
+        if (event["type"] === "tool_execution_end" && event["isError"] !== true) {
+          const toolName = recordString(event, "toolName");
+          const result = event["result"];
+          const id =
+            toolName === "bg_run"
+              ? recordString(recordField(result, "details"), "id")
+              : toolName === "bash"
+                ? PI_BG_HANDOFF_STARTED.exec(contentText(recordField(result, "content")))?.[1]
+                : undefined;
+          if (id === undefined || !PI_BG_JOB_ID.test(id) || backgroundJobs.has(id)) return false;
+          const toolCallId = recordString(event, "toolCallId");
+          const command = recordString(
+            toolCallId === undefined
+              ? undefined
+              : threadState?.activeTurn?.toolArgs.get(toolCallId),
+            "command",
+          )
+            ?.replaceAll(/\s+/gu, " ")
+            .trim()
+            .slice(0, MAX_BACKGROUND_JOB_DESCRIPTION_LENGTH);
+          backgroundJobs.set(id, {
+            taskId: id,
+            kind: "background_task",
+            description: command === undefined || command.length === 0 ? id : command,
+            ...(toolCallId === undefined ? {} : { nativeItemId: toolCallId }),
+          });
+          return true;
+        }
+        if (event["type"] === "message_end") {
+          const message = event["message"];
+          if (
+            recordString(message, "role") !== "custom" ||
+            recordString(message, "customType") !== "background-job"
+          )
+            return false;
+          const headline = recordString(recordField(message, "details"), "headline") ?? "";
+          const id = PI_BG_JOB_FINISHED.exec(headline)?.[1];
+          return id !== undefined && backgroundJobs.delete(id);
+        }
+        return false;
+      };
+
       const clearExtensionStatuses = Effect.fn("PiAdapter.clearExtensionStatuses")(function* () {
         if (sessionEntity.extensionStatuses?.length === 0) return;
         sessionEntity = { ...sessionEntity, extensionStatuses: [] };
@@ -825,6 +882,22 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...(retainedNativeTurnIds === undefined ? {} : { retainedNativeTurnIds }),
           });
         });
+
+      const syncBackgroundRoster = Effect.fn("PiAdapter.syncBackgroundRoster")(function* () {
+        if (threadState === null) return;
+        backgroundRosterThread = threadState;
+        yield* updateProviderThread(threadState, {
+          pendingBackgroundTasks: [...backgroundJobs.values()],
+        });
+      });
+
+      const endBackgroundJobs = Effect.fn("PiAdapter.endBackgroundJobs")(function* () {
+        backgroundJobs.clear();
+        const state = backgroundRosterThread;
+        backgroundRosterThread = null;
+        if (state !== null && (state.providerThread.pendingBackgroundTasks?.length ?? 0) > 0)
+          yield* updateProviderThread(state, { pendingBackgroundTasks: [] });
+      });
 
       const itemOrdinal = (turn: ActivePiTurn, nativeItemId: string): number => {
         const existing = turn.itemOrdinals.get(nativeItemId);
@@ -939,6 +1012,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   yield* updateProviderSession(sessionEntity.status);
                 }),
               );
+            } else {
+              // The replaced session's extensions abort their jobs on shutdown, without a message.
+              yield* sessionEventPermit.withPermits(1)(endBackgroundJobs());
             }
             return result;
           }).pipe(
@@ -2737,6 +2813,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             Effect.gen(function* () {
               // Tracked here rather than in handleSessionEvent, which also
               // replays buffered wake events after they were observed.
+              if (observeBackgroundJobs(event)) yield* syncBackgroundRoster();
               if (event["type"] === "compaction_start") nativeCompacting = true;
               if (event["type"] === "compaction_end") {
                 nativeCompacting = false;
@@ -3003,6 +3080,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     ? { nativeConversationHeadRef: null, contextUsage: null }
                     : {}),
                   status: "idle",
+                  pendingBackgroundTasks: [...backgroundJobs.values()],
                   updatedAt: createdAt,
                 }
               : {
@@ -3022,7 +3100,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   lastRunOrdinal: null,
                   handoffIds: [],
                   forkedFrom: null,
-                  pendingBackgroundTasks: [],
+                  pendingBackgroundTasks: [...backgroundJobs.values()],
                   createdAt,
                   updatedAt: createdAt,
                 };
@@ -3047,13 +3125,15 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           );
           lastKnownLeaf = recordString(baselineEntries, "leafId") ?? null;
           leafCursorStale = baselineEntries === undefined;
+          // A job can end while get_entries is pending; the pump already updated the roster.
+          const registered = threadState?.providerThread ?? providerThread;
           if (publish)
             yield* emit({
               type: "provider_thread.updated",
               driver: PI_PROVIDER,
-              providerThread,
+              providerThread: registered,
             });
-          return providerThread;
+          return registered;
         },
         (effect) =>
           Effect.acquireUseRelease(
@@ -3197,11 +3277,18 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
-        hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
+        hasPendingBackgroundWork: Effect.sync(
+          () => pendingWake !== null || backgroundJobs.size > 0,
+        ),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
-            () => pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id,
+            () =>
+              (pendingWake !== null && pendingWake.state.providerThread.id === providerThread.id) ||
+              // The run keeps listening until it has seen the roster clear.
+              (providerThread.pendingBackgroundTasks?.length ?? 0) > 0 ||
+              (backgroundJobs.size > 0 && threadState?.providerThread.id === providerThread.id),
           ),
+        backgroundTasksEndWithProcess: true,
         getModelContextWindow: (selection) => {
           if (selection.instanceId !== options.instanceId) return undefined;
           const slug =
@@ -3365,6 +3452,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 state.providerThread = {
                   ...turnInput.providerThread,
                   nativeThreadRef: state.providerThread.nativeThreadRef,
+                  pendingBackgroundTasks: [...backgroundJobs.values()],
                 };
                 state.activeTurn = activeTurn;
                 activeTurn.adoptedWake = wake !== null && !continuation;
@@ -3508,6 +3596,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             if (turn === null && interruptInput.requestRuntimeRestart === true) {
               if (pendingWake !== null)
                 yield* sessionEventPermit.withPermits(1)(stopPendingWake(pendingWake));
+              else if (backgroundJobs.size > 0) {
+                // A job pins the idle session, so Stop must end it too.
+                stopRequested = true;
+                yield* connection.terminate;
+              }
               return;
             }
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {

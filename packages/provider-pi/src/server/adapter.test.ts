@@ -172,7 +172,7 @@ interface FakePi {
   readonly failNextState: (skip?: number) => void;
   readonly failNextThinking: () => void;
   readonly deferNextLifecycle: (
-    type: "switch_session" | "new_session" | "fork" | "prompt" | "abort",
+    type: "switch_session" | "new_session" | "fork" | "prompt" | "abort" | "get_entries",
   ) => void;
   readonly deferNextModelSelection: () => void;
   readonly queueModels: (models: ReadonlyArray<unknown>) => void;
@@ -583,6 +583,36 @@ const openRuntime = Effect.fnUntraced(function* (
   return { runtime, takeEvent };
 });
 
+/** What pi-background's bg_run returns when it starts a job. */
+const backgroundJobStarted = (id: string, toolCallId = `call-${id}`) => ({
+  type: "tool_execution_end",
+  toolCallId,
+  toolName: "bg_run",
+  isError: false,
+  result: {
+    content: [
+      { type: "text", text: `Started ${id}; log: /tmp/pi-bg/1-${id}.log. You will be notified.` },
+    ],
+    details: { id, log: `/tmp/pi-bg/1-${id}.log` },
+  },
+});
+
+/** The message pi-background sends when a job ends, or while it runs with wake_on. */
+const backgroundJobMessage = (headline: string) => ({
+  type: "message_end",
+  message: {
+    role: "custom",
+    customType: "background-job",
+    display: true,
+    details: { headline, last: "", error: false },
+  },
+});
+
+const rosterIds = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+  event.type === "provider_thread.updated"
+    ? (event.providerThread.pendingBackgroundTasks ?? []).map((task) => task.taskId)
+    : undefined;
+
 const makeAppThread = Effect.fnUntraced(function* (model: string, threadId = THREAD_ID) {
   const now = yield* DateTime.now;
   return {
@@ -790,6 +820,260 @@ describe("PiAdapterV2", () => {
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
+  it.effect("pins the session for pi-background jobs from their start result to their exit", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const otherThread = {
+        ...providerThread,
+        id: ProviderThreadId.make("other-provider-thread"),
+      };
+      let published: ReadonlyArray<string> = [];
+      const nextRoster = Effect.gen(function* () {
+        const event = yield* takeEvent((candidate) => {
+          const ids = rosterIds(candidate);
+          return ids !== undefined && ids.join() !== published.join();
+        });
+        published = rosterIds(event) ?? [];
+        return event.type === "provider_thread.updated"
+          ? (event.providerThread.pendingBackgroundTasks ?? [])
+          : [];
+      });
+
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "call-bg1",
+        toolName: "bg_run",
+        args: { command: "sleep  300\n" },
+      });
+      yield* fake.emit(backgroundJobStarted("bg1", "call-bg1"));
+      assert.deepEqual(yield* nextRoster, [
+        {
+          taskId: "bg1",
+          kind: "background_task",
+          description: "sleep 300",
+          nativeItemId: "call-bg1",
+        },
+      ]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(otherThread));
+
+      yield* fake.emit({
+        type: "tool_execution_start",
+        toolCallId: "call-bash",
+        toolName: "bash",
+        args: { command: "make build" },
+      });
+      yield* fake.emit({
+        type: "tool_execution_end",
+        toolCallId: "call-bash",
+        toolName: "bash",
+        isError: false,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: "Still running after 2m, so it moved to the background as bg2. You will be notified when it exits.",
+            },
+          ],
+        },
+      });
+      assert.deepEqual(
+        (yield* nextRoster).map((task) => [task.taskId, task.description]),
+        [
+          ["bg1", "sleep 300"],
+          ["bg2", "make build"],
+        ],
+      );
+
+      // None of these starts or ends a job.
+      for (const record of [
+        { ...backgroundJobStarted("bg9"), isError: true },
+        backgroundJobStarted("bg1"),
+        backgroundJobStarted("not-a-job"),
+        backgroundJobMessage("bg1 matched /ready/"),
+        backgroundJobMessage("bg1, bg2 still running"),
+        { ...backgroundJobMessage("bg1 exited 0"), message: { role: "assistant" } },
+        {
+          type: "tool_execution_end",
+          toolCallId: "call-plain",
+          toolName: "bash",
+          isError: false,
+          result: { content: [{ type: "text", text: "done" }] },
+        },
+        { type: "extension_ui_request", id: "barrier", method: "input", title: "Continue?" },
+      ]) {
+        yield* fake.emit(record);
+      }
+      const observed: ProviderAdapter.ProviderAdapterV2Event[] = [];
+      yield* takeEvent((event) => {
+        observed.push(event);
+        return event.type === "runtime_request.updated";
+      });
+      assert.isFalse(observed.some((event) => event.type === "provider_thread.updated"));
+
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+
+      // A follow-up turn adopts the live session: no switch_session, and its stale snapshot
+      // cannot hide the running jobs.
+      const resumed = yield* runtime.resumeThread({ providerThread });
+      assert.deepEqual(
+        resumed.pendingBackgroundTasks?.map((task) => task.taskId),
+        ["bg1", "bg2"],
+      );
+      yield* startTurn(runtime, providerThread, "default", [], "Hello again", undefined, 2);
+      yield* fake.takeRequest("prompt");
+      const adopted = yield* takeEvent(
+        (event) =>
+          event.type === "provider_thread.updated" && event.providerThread.status === "active",
+      );
+      assert.deepEqual(rosterIds(adopted), ["bg1", "bg2"]);
+      assert.isFalse(
+        fake
+          .allRequests()
+          .some(
+            (request) => request["type"] === "switch_session" || request["type"] === "new_session",
+          ),
+      );
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((event) => event.type === "turn.terminal");
+
+      yield* fake.emit(backgroundJobMessage("bg1 exited 0 · 3s"));
+      assert.deepEqual(
+        (yield* nextRoster).map((task) => task.taskId),
+        ["bg2"],
+      );
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* fake.emit(backgroundJobMessage("bg2 killed · 1m"));
+      assert.deepEqual(yield* nextRoster, []);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(providerThread));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("lets Stop end an idle session only while a pi-background job pins it", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      const stop = runtime.interruptTurn({
+        providerThread,
+        providerTurnId: ProviderTurnId.make("settled-turn"),
+        requestRuntimeRestart: true,
+      });
+      yield* stop;
+      assert.equal(runtime.providerSession.status, "ready");
+      yield* fake.emit(backgroundJobStarted("bg1"));
+      yield* takeEvent((event) => rosterIds(event)?.join() === "bg1");
+      yield* stop;
+      yield* takeEvent(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "stopped",
+      );
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("does not restore a job's roster entry when a wake adopts a stale snapshot", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const offers =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        undefined,
+        { offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid) },
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit(backgroundJobStarted("bg1"));
+      yield* takeEvent((event) => rosterIds(event)?.join() === "bg1");
+      const staleSnapshot = {
+        ...providerThread,
+        pendingBackgroundTasks: [{ taskId: "bg1", kind: "background_task" as const }],
+      };
+      yield* fake.emit({ type: "agent_start" });
+      yield* Queue.take(offers);
+      yield* fake.emit(backgroundJobMessage("bg1 exited 0 · 3s"));
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent(
+        (event) =>
+          event.type === "provider_session.updated" && event.providerSession.status === "ready",
+      );
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* startTurn(
+        runtime,
+        staleSnapshot,
+        "default",
+        [],
+        "Synthetic wake",
+        undefined,
+        1,
+        THREAD_ID,
+        true,
+      );
+      const adopted = yield* takeEvent(
+        (event) =>
+          event.type === "provider_thread.updated" && event.providerThread.status === "active",
+      );
+      assert.deepEqual(rosterIds(adopted), []);
+      yield* takeEvent((event) => event.type === "turn.terminal");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("registers the roster a job's exit left while Pi was answering", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.takeRequest("get_entries");
+      yield* fake.emit(backgroundJobStarted("bg1"));
+      yield* takeEvent((event) => rosterIds(event)?.join() === "bg1");
+      fake.deferNextLifecycle("get_entries");
+      const registering = yield* runtime.resumeThread({ providerThread }).pipe(Effect.forkChild);
+      const entries = yield* fake.takeRequest("get_entries");
+      yield* fake.emit(backgroundJobMessage("bg1 exited 0 · 3s"));
+      yield* takeEvent((event) => rosterIds(event)?.length === 0);
+      yield* fake.emit({
+        type: "response",
+        id: entries["id"],
+        command: "get_entries",
+        success: true,
+        data: { entries: [], leafId: null },
+      });
+      const registered = yield* Fiber.join(registering);
+      assert.deepEqual(registered.pendingBackgroundTasks, []);
+      const published = yield* takeEvent((event) => event.type === "provider_thread.updated");
+      assert.deepEqual(rosterIds(published), []);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect(
     "keeps extension status through turn settlement and clears it on native session replacement",
     () =>
@@ -809,6 +1093,8 @@ describe("PiAdapterV2", () => {
           statusKey: "watch",
           statusText: "Watching",
         });
+        yield* fake.emit(backgroundJobStarted("bg1"));
+        yield* takeEvent((event) => rosterIds(event)?.join() === "bg1");
         yield* fake.emit({ type: "agent_settled" });
         yield* takeEvent((event) => event.type === "turn.terminal");
         assert.deepInclude(runtime.providerSession, {
@@ -829,12 +1115,22 @@ describe("PiAdapterV2", () => {
         ]);
         yield* fake.emit({ type: "agent_settled" });
         yield* takeEvent((event) => event.type === "turn.terminal");
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
         yield* runtime.ensureThread({
           threadId: THREAD_ID,
           modelSelection: modelSelection("default"),
           runtimePolicy,
         });
         assert.deepInclude(runtime.providerSession, { extensionStatuses: [] });
+        // The replaced session's jobs died with its extensions, and so does the old roster.
+        const cleared = yield* takeEvent(
+          (event) => event.type === "provider_thread.updated" && rosterIds(event)?.length === 0,
+        );
+        assert.equal(
+          cleared.type === "provider_thread.updated" && cleared.providerThread.id,
+          providerThread.id,
+        );
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -939,6 +1235,8 @@ describe("PiAdapterV2", () => {
         title: "Continue?",
       });
       yield* takeEvent((event) => event.type === "runtime_request.updated");
+      yield* fake.emit(backgroundJobStarted("bg1"));
+      yield* takeEvent((event) => rosterIds(event)?.join() === "bg1");
       fake.queueState({ sessionFile: "/fake/other-session.jsonl" });
       fake.vetoNextSwitch();
       const exit = yield* runtime.resumeThread({ providerThread }).pipe(Effect.exit);
@@ -946,6 +1244,8 @@ describe("PiAdapterV2", () => {
       assert.deepEqual(runtime.providerSession.extensionStatuses, [
         { key: "watch", text: "Watching" },
       ]);
+      // A veto keeps the session, so its jobs keep running.
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -1035,6 +1335,7 @@ describe("PiAdapterV2", () => {
           statusKey: "watch",
           statusText: "Watching",
         });
+        yield* fake.emit(backgroundJobStarted("bg1"));
         yield* fake.emit({
           type: "extension_ui_request",
           id: "status-barrier",
@@ -1045,6 +1346,7 @@ describe("PiAdapterV2", () => {
         assert.deepInclude(runtime.providerSession, {
           extensionStatuses: [{ key: "watch", text: "Watching" }],
         });
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
         if (retirement === "stop") {
           yield* runtime.interruptTurn({
             providerThread,
@@ -1058,6 +1360,7 @@ describe("PiAdapterV2", () => {
             event.providerSession.status === (retirement === "stop" ? "stopped" : "error"),
         );
         assert.deepInclude(runtime.providerSession, { extensionStatuses: [] });
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
       }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
