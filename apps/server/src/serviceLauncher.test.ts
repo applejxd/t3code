@@ -98,6 +98,15 @@ it("orders exact semantic versions without treating build metadata as precedence
   assert.equal(compareExactServiceVersions("2.0.0+one", "2.0.0+two"), 0);
 });
 
+it("orders a fork release above the plain release of its base and below the next base", () => {
+  assert.equal(compareExactServiceVersions("1.2.3-fork.1", "1.2.3"), 1);
+  assert.equal(compareExactServiceVersions("1.2.3", "1.2.3-fork.9"), -1);
+  assert.equal(compareExactServiceVersions("1.2.3-fork.1+build", "1.2.3"), 1);
+  assert.equal(compareExactServiceVersions("1.2.3-fork.10", "1.2.3-fork.9"), 1);
+  assert.equal(compareExactServiceVersions("1.2.4", "1.2.3-fork.9"), 1);
+  assert.equal(compareExactServiceVersions("1.2.3-fork-1", "1.2.3"), -1);
+});
+
 it("rejects contradictory service state", () => {
   assert.isUndefined(
     decodeServiceState({

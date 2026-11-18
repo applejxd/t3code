@@ -196,6 +196,10 @@ function decodeServiceUpdate(value: unknown): ServiceUpdateRecord | undefined {
   return undefined;
 }
 
+// The prerelease of a fork release, as in packages/shared/src/cliRelease.ts. Copied: the launcher
+// loads this file and cannot depend on Effect.
+const FORK_PRERELEASE = /^fork\.\d+$/;
+
 export function compareExactServiceVersions(left: string, right: string): number {
   const parse = (version: string) => {
     const withoutBuild = version.split("+", 1)[0] ?? version;
@@ -206,6 +210,7 @@ export function compareExactServiceVersions(left: string, right: string): number
     return {
       core: [BigInt(major), BigInt(minor), BigInt(patch)] as const,
       prerelease: prerelease?.split(".") ?? [],
+      fork: prerelease !== undefined && FORK_PRERELEASE.test(prerelease),
     };
   };
   const a = parse(left);
@@ -216,7 +221,11 @@ export function compareExactServiceVersions(left: string, right: string): number
     if (x !== y) return x < y ? -1 : 1;
   }
   if (a.prerelease.length === 0 || b.prerelease.length === 0) {
-    return a.prerelease.length === b.prerelease.length ? 0 : a.prerelease.length === 0 ? 1 : -1;
+    if (a.prerelease.length === b.prerelease.length) return 0;
+    // Plain outranks a prerelease of its base, except a fork release (see compareCliReleaseVersions).
+    const leftPlain = a.prerelease.length === 0;
+    const plainWins = !(leftPlain ? b : a).fork;
+    return leftPlain === plainWins ? 1 : -1;
   }
   const count = Math.max(a.prerelease.length, b.prerelease.length);
   for (let index = 0; index < count; index += 1) {

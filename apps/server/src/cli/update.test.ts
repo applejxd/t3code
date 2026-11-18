@@ -51,26 +51,82 @@ const unrelatedLsof = ProcessRunner.ProcessRunner.of({
 
 afterEach(() => vi.restoreAllMocks());
 
+const releaseListing = (
+  pages: Readonly<Record<string, ReadonlyArray<string>>>,
+  requested: string[] = [],
+) =>
+  HttpClient.make((request) => {
+    const url = new URL(request.url);
+    assert.equal(url.origin, "https://api.github.com");
+    assert.equal(url.pathname, "/repos/applejxd/t3code/releases");
+    assert.equal(request.headers.accept, "application/vnd.github+json");
+    assert.equal(request.headers.authorization, "Bearer gh-token");
+    const page = url.searchParams.get("page") ?? "";
+    requested.push(page);
+    return Effect.succeed(
+      HttpClientResponse.fromWeb(
+        request,
+        Response.json((pages[page] ?? []).map((tag_name) => ({ tag_name }))),
+      ),
+    );
+  });
+
+const resolveListed = (
+  channel: "stable" | "nightly" | "preview",
+  pages: Readonly<Record<string, ReadonlyArray<string>>>,
+  requested: string[],
+) =>
+  resolveNewestVersion(channel).pipe(
+    Effect.provideService(HostProcess.Environment, { GH_TOKEN: "gh-token" }),
+    Effect.provideService(HttpClient.HttpClient, releaseListing(pages, requested)),
+  );
+
+// A full page of one tag, as GitHub returns for a long release list.
+const fullPage = (tag: string) => Array.from({ length: 100 }, () => tag);
+
 it.effect("authenticates each release page until the requested channel is found", () =>
   Effect.gen(function* () {
-    const pages: string[] = [];
-    const httpClient = HttpClient.make((request) => {
-      const url = new URL(request.url);
-      assert.equal(url.origin, "https://api.github.com");
-      assert.equal(url.pathname, "/repos/pingdotgg/t3code/releases");
-      assert.equal(request.headers.accept, "application/vnd.github+json");
-      assert.equal(request.headers.authorization, "Bearer gh-token");
-      const page = url.searchParams.get("page") ?? "";
-      pages.push(page);
-      const tag_name = page === "1" ? "v1.2.4-preview.20260101.1" : "v1.2.3";
-      return Effect.succeed(HttpClientResponse.fromWeb(request, Response.json([{ tag_name }])));
-    });
-    const version = yield* resolveNewestVersion("stable").pipe(
-      Effect.provideService(HostProcess.Environment, { GH_TOKEN: "gh-token" }),
-      Effect.provideService(HttpClient.HttpClient, httpClient),
+    const requested: string[] = [];
+    const version = yield* resolveListed(
+      "stable",
+      { "1": fullPage("v1.2.4-preview.20260101.1"), "2": ["v1.2.3"] },
+      requested,
     );
     assert.equal(version, "1.2.3");
-    assert.deepStrictEqual(pages, ["1", "2"]);
+    assert.deepStrictEqual(requested, ["1", "2"]);
+  }),
+);
+
+it.effect("ranks stable fork releases across every page, ahead of plain releases", () =>
+  Effect.gen(function* () {
+    const requested: string[] = [];
+    const version = yield* resolveListed(
+      "stable",
+      {
+        "1": [...fullPage("v2.0.0").slice(1), "v1.9.0-fork.2"],
+        "2": ["v1.10.0-fork.1", "v1.10.0-fork.3", "v1.10.0-fork.2"],
+      },
+      requested,
+    );
+    assert.equal(version, "1.10.0-fork.3");
+    // The first page holds a plain release and a fork release, and still the next one is read.
+    assert.deepStrictEqual(requested, ["1", "2"]);
+  }),
+);
+
+it.effect("stops reading nightlies at the first page that has one", () =>
+  Effect.gen(function* () {
+    const requested: string[] = [];
+    const version = yield* resolveListed(
+      "nightly",
+      {
+        "1": [...fullPage("v1.2.3-fork.1").slice(1), "v1.2.4-nightly.20260101.2"],
+        "2": ["v1.2.4-nightly.20260101.1"],
+      },
+      requested,
+    );
+    assert.equal(version, "1.2.4-nightly.20260101.2");
+    assert.deepStrictEqual(requested, ["1"]);
   }),
 );
 
@@ -600,6 +656,58 @@ it.layer(NodeServices.layer)("t3 update with a background service", (it) => {
       assert.include(
         output,
         `Background service still running the version before ${version}. Run \`t3 service restart\` when you are ready to switch it to ${version}.`,
+      );
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provideService(HostProcess.Environment, { PATH: "" }),
+    ),
+  );
+
+  it.effect("does not move a fork service sideways to the plain release of its base", () =>
+    Effect.gen(function* () {
+      yield* withoutTerminals;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-update-" });
+      const service = Layer.mock(BootService.BootService, {
+        status: Effect.succeed<BootService.BootServiceStatus>({
+          supported: true,
+          installed: true,
+          current: true,
+          installedVersion: `${packageJson.version}-fork.1`,
+          installedBaseDir: baseDir,
+          unitPath: path.join(baseDir, "t3code.service"),
+          logPath: path.join(baseDir, "boot-service.log"),
+        }),
+      });
+
+      const error = yield* runUpdate({
+        baseDir,
+        logsDir: baseDir,
+        serverRuntimeStatePath: path.join(baseDir, "server-runtime.json"),
+        channel: undefined,
+        requestedVersion: packageJson.version,
+        allowDowngrade: false,
+        assumeYes: false,
+      }).pipe(
+        Effect.flip,
+        Effect.provide(
+          Layer.mergeAll(
+            service,
+            Layer.succeed(ProcessRunner.ProcessRunner, unrelatedLsof),
+            ManagedPolicy.layerTest(),
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make(() => Effect.die("unexpected release lookup")),
+            ),
+            Layer.fresh(TestConsole.layer),
+          ),
+        ),
+      );
+
+      assert.include(
+        error.message,
+        `t3@${packageJson.version} is older than the installed ${packageJson.version}-fork.1.`,
       );
     }).pipe(
       Effect.provideService(HostProcess.Platform, "linux"),
