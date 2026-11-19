@@ -13,8 +13,8 @@
 #   T3CODE_INSTALL_BIN_DIR   where the `t3` command goes (default: ~/.local/bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
 #
-# Finding the newest release uses the GitHub API. If the gh CLI is installed and already signed
-# in (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
+# Finding the newest release uses the GitHub API. If the gh CLI is installed and has a token for
+# github.com (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
 # otherwise, or if gh fails, it is requested anonymously. gh is never required or asked to log in.
 #
 # The archive is unpacked into $T3CODE_HOME/runtime/versions/<version>, the
@@ -100,18 +100,26 @@ fetch() {
   fi
 }
 
-# Lists one page of releases ($1) into $2. Through gh when it is installed and already signed in to
+# Succeeds when gh holds a token for github.com. Reads local state only, so it needs no network.
+# stdin from /dev/null: under `curl ... | sh` it is the script itself.
+gh_has_token() {
+  token=$(gh auth token --hostname github.com </dev/null 2>/dev/null) && [ -n "$token" ]
+}
+
+# Lists one page of releases ($1) into $2. Through gh when it is installed and has a token for
 # github.com, so the call counts against the user's 5000/hour quota instead of the anonymous 60/hour
-# per IP that shared NATs exhaust. gh stays optional: no login, no prompt, and any gh failure falls
-# back to the anonymous request. Someone who can push also lists drafts, which have no public
-# assets, so those keep their line but get an empty tag_name that no tag pattern matches.
+# per IP that shared NATs exhaust. The probe is local evidence, never `gh auth status`: its exit
+# code is 1 when any account or host in gh's config fails verification, even if the active
+# github.com account is fine. gh stays optional: no login, no prompt, and any gh failure falls back
+# to the anonymous request for the rest of the run. Someone who can push also lists drafts, which
+# have no public assets, so those keep their line but get an empty tag_name that no tag pattern
+# matches.
 gh_releases=
 list_releases() {
   if [ -z "$gh_releases" ]; then
     gh_releases=no
-    # stdin from /dev/null: under `curl ... | sh` it is the script itself.
     if command -v gh >/dev/null 2>&1 &&
-      { [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] || gh auth status --hostname github.com </dev/null >/dev/null 2>&1; }; then
+      { [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] || gh_has_token; }; then
       gh_releases=yes
     fi
   fi
