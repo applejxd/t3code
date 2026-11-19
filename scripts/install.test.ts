@@ -69,6 +69,187 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer home
   });
 });
 
+/** Commands install.sh needs to resolve a release and write the launcher, none of them gh. */
+const releaseTools = [
+  "sh",
+  "uname",
+  "tar",
+  "cut",
+  "curl",
+  "grep",
+  "mkdir",
+  "mktemp",
+  "rm",
+  "mv",
+  "ln",
+  "chmod",
+  "sed",
+  "sort",
+  "head",
+  "cat",
+  "tr",
+  "wc",
+  "sleep",
+];
+
+const commandPath = (command: string) =>
+  NodeChildProcess.spawnSync("sh", ["-c", 'command -v "$1"', "sh", command], {
+    encoding: "utf8",
+  }).stdout.trim();
+
+/** A fake gh: logs each call, is signed in when `signed-in` exists, and prints `page-<n>` or fails. */
+const ghStub = `#!/bin/sh
+printf '%s\\n' "$*" >> "$GH_STUB_DIR/calls"
+case "$1" in
+  auth) [ -f "$GH_STUB_DIR/signed-in" ]; exit $? ;;
+  api)
+    for argument in "$@"; do case "$argument" in repos/*) endpoint="$argument" ;; esac; done
+    page="\${endpoint##*page=}"
+    if [ -f "$GH_STUB_DIR/page-$page" ]; then cat "$GH_STUB_DIR/page-$page"; exit 0; fi
+    # A failing gh can leave output behind; the installer must not read it.
+    printf '{"tag_name":"v9.9.9-fork.9"}\\n'
+    exit 1 ;;
+esac
+exit 1
+`;
+
+type GhMode = "absent" | "signed-out" | "signed-in" | "token" | "failing" | "failing-page-2";
+
+/** Resolves the release against a local GitHub fixture and a fake gh (or none). */
+async function lookupRelease(input: {
+  readonly channel: string;
+  readonly pinned: string;
+  readonly version: string;
+  readonly failures: number;
+  readonly page1: readonly string[];
+  readonly page2: readonly string[];
+  readonly gh: GhMode;
+  /** What gh lists as page 2 when it can; the fixture server keeps `page2`. */
+  readonly ghPage2?: readonly string[];
+}) {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-install-index-"));
+  const target = NodePath.join(root, "home/runtime/versions", input.version);
+  const pages: Record<string, readonly string[]> = {
+    "1": [
+      ...input.page1,
+      ...nightlies.slice(input.page1.length).map((release) => release.tag_name),
+    ],
+    "2": input.page2,
+  };
+  const apiPages: string[] = [];
+  let failures = input.failures;
+  const server = NodeHttp.createServer((request, response) => {
+    if (failures-- > 0) return response.writeHead(504).end();
+    const url = new URL(request.url ?? "/", "http://fixture");
+    if (url.pathname === `/repos/${repository}/releases`) {
+      apiPages.push(url.searchParams.get("page") ?? "");
+    }
+    const body =
+      url.pathname === `/${repository}/releases/latest` &&
+      request.headers.accept === "application/json"
+        ? { tag_name: "v1.2.3" }
+        : url.pathname === `/repos/${repository}/releases`
+          ? pages[url.searchParams.get("page") ?? ""]?.map((tag_name) => ({ tag_name }))
+          : undefined;
+    if (body === undefined) response.statusCode = 404;
+    // The API pretty-prints and the installer reads it line by line.
+    response.end(JSON.stringify(body ?? [], null, 2));
+  });
+  try {
+    // An existing completed install isolates release resolution from archive downloads.
+    await NodeFSP.mkdir(target, { recursive: true });
+    await NodeFSP.writeFile(NodePath.join(target, ".install-complete"), `${input.version}\n`);
+
+    // gh prints one compact object per release, drafts blanked, as install.sh's --jq filter asks.
+    const ghDir = NodePath.join(root, "gh");
+    await NodeFSP.mkdir(ghDir);
+    await NodeFSP.writeFile(NodePath.join(ghDir, "gh"), ghStub, { mode: 0o755 });
+    const ghPages = { "1": pages["1"] ?? [], "2": input.ghPage2 ?? input.page2 };
+    const served =
+      input.gh === "signed-in" || input.gh === "token"
+        ? (["1", "2"] as const)
+        : input.gh === "failing-page-2"
+          ? (["1"] as const)
+          : [];
+    for (const page of served) {
+      await NodeFSP.writeFile(
+        NodePath.join(ghDir, `page-${page}`),
+        ghPages[page].map((tag_name) => `${JSON.stringify({ tag_name })}\n`).join(""),
+      );
+    }
+    if (input.gh !== "signed-out" && input.gh !== "token") {
+      await NodeFSP.writeFile(NodePath.join(ghDir, "signed-in"), "");
+    }
+
+    // Without gh on PATH at all, only the tools the installer needs are reachable.
+    const tools = NodePath.join(root, "tools");
+    await NodeFSP.mkdir(tools);
+    for (const command of [
+      ...releaseTools,
+      ...["sha256sum", "shasum"].filter((tool) => commandPath(tool) !== ""),
+    ]) {
+      await NodeFSP.symlink(commandPath(command), NodePath.join(tools, command));
+    }
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const source = await NodeFSP.readFile(
+      NodePath.resolve(import.meta.dirname, "install.sh"),
+      "utf8",
+    );
+    const installer = NodePath.join(root, "install.sh");
+    await NodeFSP.writeFile(installer, source.replace(/https:\/\/(api\.)?github\.com/g, origin));
+    const { code, output } = await new Promise<{ code: number | null; output: string }>(
+      (resolve, reject) => {
+        const child = NodeChildProcess.spawn("sh", [installer], {
+          env: {
+            ...process.env,
+            // The developer's own gh and tokens must never leak into a lookup test.
+            PATH: input.gh === "absent" ? tools : `${ghDir}:${process.env.PATH ?? ""}`,
+            GH_STUB_DIR: ghDir,
+            GH_TOKEN: input.gh === "token" ? "stub-token" : undefined,
+            GITHUB_TOKEN: undefined,
+            T3CODE_VERSION: input.pinned,
+            T3CODE_CHANNEL: input.channel,
+            T3CODE_HOME: NodePath.join(root, "home"),
+            T3CODE_INSTALL_BIN_DIR: NodePath.join(root, "bin"),
+            // A wrong version must fail here instead of downloading a real release.
+            T3CODE_RELEASE_BASE_URL: origin,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let output = "";
+        child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
+        child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
+        child.on("error", reject);
+        child.on("close", (code) => resolve({ code, output }));
+      },
+    );
+    const ghCalls = await NodeFSP.readFile(NodePath.join(ghDir, "calls"), "utf8").then(
+      (calls) => calls.split("\n").filter((call) => call !== ""),
+      () => [],
+    );
+    return { code, output, ghCalls, apiPages };
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await NodeFSP.rm(root, { recursive: true, force: true });
+  }
+}
+
+const forkPage1 = ["v1.9.9-fork.12", "v2.0.0"];
+const forkPage2 = [
+  "v1.4.0-preview.20261019.50",
+  "v1.2.3",
+  "v1.10.0-fork.2",
+  "v1.10.0-fork.10",
+  "v1.10.0-fork.9",
+  "v1.11.0-fork.1-rc.1",
+  "v1.11.0-fork",
+];
+
 // regression: #22490
 describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer channel lookup", () => {
   it.each([
@@ -89,16 +270,8 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
       pinned: "",
       version: "1.10.0-fork.10",
       failures: 1,
-      page1: ["v1.9.9-fork.12", "v2.0.0"],
-      page2: [
-        "v1.4.0-preview.20261019.50",
-        "v1.2.3",
-        "v1.10.0-fork.2",
-        "v1.10.0-fork.10",
-        "v1.10.0-fork.9",
-        "v1.11.0-fork.1-rc.1",
-        "v1.11.0-fork",
-      ],
+      page1: forkPage1,
+      page2: forkPage2,
     },
     // An explicit version of either form is installed as given, whatever is newest.
     {
@@ -117,73 +290,115 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
     },
   ])(
     "installs $version on $channel (T3CODE_VERSION='$pinned') behind nightlies and $failures HTTP 504s",
-    async ({ channel, pinned, version, failures, page1 = [], page2 }) => {
-      const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-install-index-"));
-      const target = NodePath.join(root, "home/runtime/versions", version);
-      const server = NodeHttp.createServer((request, response) => {
-        if (failures-- > 0) return response.writeHead(504).end();
-        const url = new URL(request.url ?? "/", "http://fixture");
-        const body =
-          url.pathname === `/${repository}/releases/latest` &&
-          request.headers.accept === "application/json"
-            ? { tag_name: "v1.2.3" }
-            : url.pathname === `/repos/${repository}/releases`
-              ? {
-                  "1": [
-                    ...page1.map((tag_name) => ({ tag_name })),
-                    ...nightlies.slice(page1.length),
-                  ],
-                  "2": page2.map((tag_name) => ({ tag_name })),
-                }[url.searchParams.get("page") ?? ""]
-              : undefined;
-        if (body === undefined) response.statusCode = 404;
-        // The API pretty-prints and the installer reads it line by line.
-        response.end(JSON.stringify(body ?? [], null, 2));
+    async ({ page1 = [], ...row }) => {
+      const { code, output, ghCalls } = await lookupRelease({
+        ...row,
+        page1,
+        gh: "signed-out",
       });
-      try {
-        // An existing completed install isolates release resolution from archive downloads.
-        await NodeFSP.mkdir(target, { recursive: true });
-        await NodeFSP.writeFile(NodePath.join(target, ".install-complete"), `${version}\n`);
-        await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-        const address = server.address();
-        if (!address || typeof address === "string") throw new Error("Expected a TCP listener");
-        const origin = `http://127.0.0.1:${address.port}`;
-        const source = await NodeFSP.readFile(
-          NodePath.resolve(import.meta.dirname, "install.sh"),
-          "utf8",
+      expect(code, output).toBe(0);
+      expect(output).toContain(`Installed T3 Code ${row.version}`);
+      expect(ghCalls.filter((call) => call.startsWith("api "))).toEqual([]);
+    },
+  );
+
+  // The fixture server lists fork.10 as the newest; only gh's own listing has fork.11.
+  const ghListing = {
+    channel: "stable",
+    pinned: "",
+    failures: 0,
+    page1: forkPage1,
+    page2: forkPage2,
+    ghPage2: [...forkPage2, "v1.10.0-fork.11"],
+  };
+  it.each([
+    // Signed in, or GH_TOKEN set: the listing runs through gh and never touches the anonymous API.
+    {
+      ...ghListing,
+      gh: "signed-in",
+      version: "1.10.0-fork.11",
+      ghCalls: ["auth", "api", "api"],
+      apiPages: [],
+    },
+    {
+      ...ghListing,
+      gh: "token",
+      version: "1.10.0-fork.11",
+      ghCalls: ["api", "api"],
+      apiPages: [],
+    },
+    {
+      ...ghListing,
+      gh: "signed-in",
+      channel: "preview",
+      page2: ["v1.2.4-preview.20261019.49"],
+      ghPage2: ["v1.2.4-preview.20261019.50"],
+      version: "1.2.4-preview.20261019.50",
+      ghCalls: ["auth", "api", "api"],
+      apiPages: [],
+    },
+    // The plain-release fallback is still github.com's /releases/latest, behind an HTTP 504.
+    {
+      ...ghListing,
+      gh: "signed-in",
+      failures: 1,
+      page1: [],
+      ghPage2: ["v1.2.3"],
+      version: "1.2.3",
+      ghCalls: ["auth", "api", "api"],
+      apiPages: [],
+    },
+    // Present but not signed in, or not installed: exactly the anonymous lookup.
+    {
+      ...ghListing,
+      gh: "signed-out",
+      version: "1.10.0-fork.10",
+      ghCalls: ["auth"],
+      apiPages: ["1", "2"],
+    },
+    { ...ghListing, gh: "absent", version: "1.10.0-fork.10", ghCalls: [], apiPages: ["1", "2"] },
+    // gh fails: its leftover output is ignored, gh is not asked again, and the anonymous lookup wins.
+    {
+      ...ghListing,
+      gh: "failing",
+      version: "1.10.0-fork.10",
+      ghCalls: ["auth", "api"],
+      apiPages: ["1", "2"],
+    },
+    {
+      ...ghListing,
+      gh: "failing-page-2",
+      version: "1.10.0-fork.10",
+      ghCalls: ["auth", "api", "api"],
+      apiPages: ["2"],
+    },
+    // A pinned version needs no lookup, so gh is never run.
+    {
+      ...ghListing,
+      gh: "signed-in",
+      pinned: "1.2.3-fork.1",
+      version: "1.2.3-fork.1",
+      ghCalls: [],
+      apiPages: [],
+    },
+  ] as const)(
+    "installs $version on $channel (T3CODE_VERSION='$pinned') with gh $gh and $failures HTTP 504s",
+    async ({ ghCalls: expectedCalls, apiPages: expectedPages, ...row }) => {
+      const { code, output, ghCalls, apiPages } = await lookupRelease(row);
+      expect(code, output).toBe(0);
+      expect(output).toContain(`Installed T3 Code ${row.version}`);
+      expect(ghCalls.map((call) => call.split(" ")[0])).toEqual(expectedCalls);
+      expect(apiPages).toEqual(expectedPages);
+      // The same endpoint and page size as the anonymous request, against github.com.
+      for (const call of ghCalls) {
+        expect(call).toMatch(
+          call.startsWith("auth ")
+            ? /^auth status --hostname github\.com$/u
+            : new RegExp(
+                `^api --hostname github\\.com repos/${repository}/releases\\?per_page=100&page=[12] --jq `,
+                "u",
+              ),
         );
-        const installer = NodePath.join(root, "install.sh");
-        await NodeFSP.writeFile(
-          installer,
-          source.replace(/https:\/\/(api\.)?github\.com/g, origin),
-        );
-        const { code, output } = await new Promise<{ code: number | null; output: string }>(
-          (resolve, reject) => {
-            const child = NodeChildProcess.spawn("sh", [installer], {
-              env: {
-                ...process.env,
-                T3CODE_VERSION: pinned,
-                T3CODE_CHANNEL: channel,
-                T3CODE_HOME: NodePath.join(root, "home"),
-                T3CODE_INSTALL_BIN_DIR: NodePath.join(root, "bin"),
-                // A wrong version must fail here instead of downloading a real release.
-                T3CODE_RELEASE_BASE_URL: origin,
-              },
-              stdio: ["ignore", "pipe", "pipe"],
-            });
-            let output = "";
-            child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
-            child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
-            child.on("error", reject);
-            child.on("close", (code) => resolve({ code, output }));
-          },
-        );
-        expect(code, output).toBe(0);
-        expect(output).toContain(`Installed T3 Code ${version}`);
-      } finally {
-        server.closeAllConnections();
-        await new Promise<void>((resolve) => server.close(() => resolve()));
-        await NodeFSP.rm(root, { recursive: true, force: true });
       }
     },
   );

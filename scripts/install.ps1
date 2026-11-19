@@ -12,6 +12,10 @@
 #   T3CODE_INSTALL_BIN_DIR   where t3.exe is linked (default: ~\.local\bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
 #
+# Finding the newest release uses the GitHub API. If the gh CLI is installed and already signed
+# in (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
+# otherwise, or if gh fails, it is requested anonymously. gh is never required or asked to log in.
+#
 # The archive is unpacked into $T3CODE_HOME\runtime\versions\<version>, the
 # same layout `t3 service install` uses, so the service reuses this download.
 $ErrorActionPreference = "Stop"
@@ -77,6 +81,38 @@ function Invoke-Retrying([scriptblock] $request) {
     try { return & $request }
     catch { if (-not (Wait-Retry ([int]$_.Exception.Response.StatusCode) $attempt)) { throw } }
   }
+}
+# gh's failures are judged by exit code; under Stop its stderr would be an error record instead.
+function Invoke-Gh {
+  $ErrorActionPreference = "Continue"
+  & gh @args 2>$null
+  if ($LASTEXITCODE -ne 0) { throw "gh exited with $LASTEXITCODE" }
+}
+# Lists one page of releases. Through gh when it is installed and already signed in to github.com, so
+# the call counts against the user's 5000/hour quota instead of the anonymous 60/hour per IP that
+# shared NATs exhaust. gh stays optional: no login, no prompt, and any gh failure falls back to the
+# anonymous request. Someone who can push also lists drafts, which callers filter out as before.
+$ghReleases = $null
+function Get-Releases([int] $page) {
+  if ($null -eq $script:ghReleases) {
+    $script:ghReleases = $false
+    if (Get-Command gh -CommandType Application -ErrorAction SilentlyContinue) {
+      if ($env:GH_TOKEN -or $env:GITHUB_TOKEN) { $script:ghReleases = $true }
+      else {
+        try { Invoke-Gh auth status --hostname github.com | Out-Null; $script:ghReleases = $true } catch { }
+      }
+    }
+  }
+  if ($script:ghReleases) {
+    try {
+      $json = (Invoke-Gh api --hostname github.com "repos/$repo/releases?per_page=100&page=$page" --jq '[.[] | {tag_name, draft}]') -join "`n"
+      # Windows PowerShell 5.1 returns a JSON array as one object; enumerating it here covers both.
+      $parsed = $json | ConvertFrom-Json -ErrorAction Stop
+      foreach ($release in $parsed) { $release }
+      return
+    } catch { $script:ghReleases = $false }
+  }
+  Invoke-Retrying { Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100&page=$page" -Headers @{ "User-Agent" = "t3-install" } }
 }
 function Fetch([string] $uri, [string] $destination, [switch] $progress) {
   if (-not $progress -or -not $interactive) {
@@ -160,7 +196,7 @@ if (-not $version) {
     $forkPattern = '^v(\d+\.\d+\.\d+)-fork\.(\d+)$'
     $forkTags = @()
     for ($page = 1; $page -le 10; $page++) {
-      $releases = Invoke-Retrying { Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100&page=$page" -Headers @{ "User-Agent" = "t3-install" } }
+      $releases = Get-Releases $page
       if (-not $releases) { break }
       $forkTags += @($releases | Where-Object { -not $_.draft -and $_.tag_name -match $forkPattern } | ForEach-Object { $_.tag_name })
       # A short page is the last one.
@@ -177,7 +213,7 @@ if (-not $version) {
   } else {
     $tag = $null
     for ($page = 1; -not $tag -and $page -le 10; $page++) {
-      $releases = Invoke-Retrying { Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100&page=$page" -Headers @{ "User-Agent" = "t3-install" } }
+      $releases = Get-Releases $page
       $tag = ($releases | Where-Object { -not $_.draft -and $_.tag_name -match $tagPattern } | Select-Object -First 1).tag_name
       if (-not $releases) { break }
     }
