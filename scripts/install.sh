@@ -13,6 +13,10 @@
 #   T3CODE_INSTALL_BIN_DIR   where the `t3` command goes (default: ~/.local/bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
 #
+# Finding the newest release uses the GitHub API. If the gh CLI is installed and already signed
+# in (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
+# otherwise, or if gh fails, it is requested anonymously. gh is never required or asked to log in.
+#
 # The archive is unpacked into $T3CODE_HOME/runtime/versions/<version>, the
 # same layout `t3 service install` uses, so the service reuses this download
 # instead of fetching the release again.
@@ -94,6 +98,29 @@ fetch() {
   else
     fail "curl or wget is required"
   fi
+}
+
+# Lists one page of releases ($1) into $2. Through gh when it is installed and already signed in to
+# github.com, so the call counts against the user's 5000/hour quota instead of the anonymous 60/hour
+# per IP that shared NATs exhaust. gh stays optional: no login, no prompt, and any gh failure falls
+# back to the anonymous request. Someone who can push also lists drafts, which have no public
+# assets, so those keep their line but get an empty tag_name that no tag pattern matches.
+gh_releases=
+list_releases() {
+  if [ -z "$gh_releases" ]; then
+    gh_releases=no
+    # stdin from /dev/null: under `curl ... | sh` it is the script itself.
+    if command -v gh >/dev/null 2>&1 &&
+      { [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] || gh auth status --hostname github.com </dev/null >/dev/null 2>&1; }; then
+      gh_releases=yes
+    fi
+  fi
+  if [ "$gh_releases" = yes ]; then
+    gh api --hostname github.com "repos/${repo}/releases?per_page=100&page=$1" \
+      --jq '.[] | {tag_name: (if .draft then "" else .tag_name end)}' </dev/null >"$2" 2>/dev/null && return 0
+    gh_releases=no
+  fi
+  fetch "https://api.github.com/repos/${repo}/releases?per_page=100&page=$1" "$2"
 }
 
 mb() {
@@ -198,7 +225,7 @@ if [ -z "$version" ]; then
     : > "${tmp_index}.forks"
     page=1
     while [ "$page" -le 10 ]; do
-      fetch "https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}" "$tmp_index"
+      list_releases "$page" "$tmp_index"
       sed -n 's/.*"tag_name": *"v\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)-fork\.\([0-9][0-9]*\)".*/\1 \2 \3 \4 \1.\2.\3-fork.\4/p' "$tmp_index" >> "${tmp_index}.forks"
       # A short page is the last one.
       [ "$(grep -c '"tag_name"' "$tmp_index")" -ge 100 ] || break
@@ -215,7 +242,7 @@ if [ -z "$version" ]; then
   else
     page=1
     while [ -z "$version" ] && [ "$page" -le 10 ]; do
-      fetch "https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}" "$tmp_index"
+      list_releases "$page" "$tmp_index"
       version="$(sed -n "s/.*\"tag_name\": *\"${tag_pattern}\".*/\1/p" "$tmp_index" | head -n 1)"
       grep -q '"tag_name"' "$tmp_index" || break
       page=$((page + 1))
