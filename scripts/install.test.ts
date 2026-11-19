@@ -97,11 +97,18 @@ const commandPath = (command: string) =>
     encoding: "utf8",
   }).stdout.trim();
 
-/** A fake gh: logs each call, is signed in when `signed-in` exists, and prints `page-<n>` or fails. */
+/**
+ * A fake gh: logs each call and prints `page-<n>` or fails. `auth token` prints a token only when
+ * `has-token` exists; `auth status` succeeds only when `status-ok` exists, like the real one it
+ * aggregates every account and host, so it can fail while the active account is fine.
+ */
 const ghStub = `#!/bin/sh
 printf '%s\\n' "$*" >> "$GH_STUB_DIR/calls"
+case "$1 $2" in
+  "auth token") [ -f "$GH_STUB_DIR/has-token" ] && echo stub-token; exit $? ;;
+  "auth status") [ -f "$GH_STUB_DIR/status-ok" ]; exit $? ;;
+esac
 case "$1" in
-  auth) [ -f "$GH_STUB_DIR/signed-in" ]; exit $? ;;
   api)
     for argument in "$@"; do case "$argument" in repos/*) endpoint="$argument" ;; esac; done
     page="\${endpoint##*page=}"
@@ -113,7 +120,15 @@ esac
 exit 1
 `;
 
-type GhMode = "absent" | "signed-out" | "signed-in" | "token" | "failing" | "failing-page-2";
+type GhMode =
+  | "absent"
+  | "signed-out"
+  | "signed-in"
+  /** gh holds a token, but `gh auth status` fails because another account or host is stale. */
+  | "stale-account"
+  | "token"
+  | "failing"
+  | "failing-page-2";
 
 /** Resolves the release against a local GitHub fixture and a fake gh (or none). */
 async function lookupRelease(input: {
@@ -166,7 +181,7 @@ async function lookupRelease(input: {
     await NodeFSP.writeFile(NodePath.join(ghDir, "gh"), ghStub, { mode: 0o755 });
     const ghPages = { "1": pages["1"] ?? [], "2": input.ghPage2 ?? input.page2 };
     const served =
-      input.gh === "signed-in" || input.gh === "token"
+      input.gh === "signed-in" || input.gh === "stale-account" || input.gh === "token"
         ? (["1", "2"] as const)
         : input.gh === "failing-page-2"
           ? (["1"] as const)
@@ -178,7 +193,10 @@ async function lookupRelease(input: {
       );
     }
     if (input.gh !== "signed-out" && input.gh !== "token") {
-      await NodeFSP.writeFile(NodePath.join(ghDir, "signed-in"), "");
+      await NodeFSP.writeFile(NodePath.join(ghDir, "has-token"), "");
+    }
+    if (input.gh !== "signed-out" && input.gh !== "stale-account" && input.gh !== "token") {
+      await NodeFSP.writeFile(NodePath.join(ghDir, "status-ok"), "");
     }
 
     // Without gh on PATH at all, only the tools the installer needs are reachable.
@@ -312,7 +330,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
     ghPage2: [...forkPage2, "v1.10.0-fork.11"],
   };
   it.each([
-    // Signed in, or GH_TOKEN set: the listing runs through gh and never touches the anonymous API.
+    // A token in gh, or GH_TOKEN set: the listing runs through gh and never touches the anonymous API.
     {
       ...ghListing,
       gh: "signed-in",
@@ -337,6 +355,15 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
       ghCalls: ["auth", "api", "api"],
       apiPages: [],
     },
+    // regression: `gh auth status` exits 1 when any other account or host fails verification, so
+    // it must not gate gh. A token and a working listing are enough.
+    {
+      ...ghListing,
+      gh: "stale-account",
+      version: "1.10.0-fork.11",
+      ghCalls: ["auth", "api", "api"],
+      apiPages: [],
+    },
     // The plain-release fallback is still github.com's /releases/latest, behind an HTTP 504.
     {
       ...ghListing,
@@ -348,7 +375,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
       ghCalls: ["auth", "api", "api"],
       apiPages: [],
     },
-    // Present but not signed in, or not installed: exactly the anonymous lookup.
+    // Present but without a token, or not installed: exactly the anonymous lookup.
     {
       ...ghListing,
       gh: "signed-out",
@@ -393,7 +420,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("installer chan
       for (const call of ghCalls) {
         expect(call).toMatch(
           call.startsWith("auth ")
-            ? /^auth status --hostname github\.com$/u
+            ? /^auth token --hostname github\.com$/u
             : new RegExp(
                 `^api --hostname github\\.com repos/${repository}/releases\\?per_page=100&page=[12] --jq `,
                 "u",

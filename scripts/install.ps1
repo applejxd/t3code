@@ -12,8 +12,8 @@
 #   T3CODE_INSTALL_BIN_DIR   where t3.exe is linked (default: ~\.local\bin)
 #   T3CODE_RELEASE_BASE_URL  mirror for releases/download (default: GitHub)
 #
-# Finding the newest release uses the GitHub API. If the gh CLI is installed and already signed
-# in (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
+# Finding the newest release uses the GitHub API. If the gh CLI is installed and has a token for
+# github.com (or GH_TOKEN/GITHUB_TOKEN is set), the listing goes through it under your own API quota;
 # otherwise, or if gh fails, it is requested anonymously. gh is never required or asked to log in.
 #
 # The archive is unpacked into $T3CODE_HOME\runtime\versions\<version>, the
@@ -88,10 +88,12 @@ function Invoke-Gh {
   & gh @args 2>$null
   if ($LASTEXITCODE -ne 0) { throw "gh exited with $LASTEXITCODE" }
 }
-# Lists one page of releases. Through gh when it is installed and already signed in to github.com, so
-# the call counts against the user's 5000/hour quota instead of the anonymous 60/hour per IP that
-# shared NATs exhaust. gh stays optional: no login, no prompt, and any gh failure falls back to the
-# anonymous request. Someone who can push also lists drafts, which callers filter out as before.
+# Lists one page of releases. Through gh when it is installed and has a token for github.com, so the
+# call counts against the user's 5000/hour quota instead of the anonymous 60/hour per IP that shared
+# NATs exhaust. The probe is local evidence, never `gh auth status`: its exit code is 1 when any
+# account or host in gh's config fails verification, even if the active github.com account is fine.
+# gh stays optional: no login, no prompt, and any gh failure falls back to the anonymous request for
+# the rest of the run. Someone who can push also lists drafts, which callers filter out as before.
 $ghReleases = $null
 function Get-Releases([int] $page) {
   if ($null -eq $script:ghReleases) {
@@ -99,7 +101,10 @@ function Get-Releases([int] $page) {
     if (Get-Command gh -CommandType Application -ErrorAction SilentlyContinue) {
       if ($env:GH_TOKEN -or $env:GITHUB_TOKEN) { $script:ghReleases = $true }
       else {
-        try { Invoke-Gh auth status --hostname github.com | Out-Null; $script:ghReleases = $true } catch { }
+        try {
+          $token = (Invoke-Gh auth token --hostname github.com) -join ""
+          if ($token.Trim()) { $script:ghReleases = $true }
+        } catch { }
       }
     }
   }
