@@ -1,5 +1,7 @@
 > **This is a fork.** [applejxd](https://github.com/applejxd)'s fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code). It keeps Pi's `pi-background` (`bg_run`) jobs alive instead of letting the idle release stop them, and lets a Pi session stay pinned for up to 7 days while background work runs. Everything below this notice is the upstream README, and its install commands install the **upstream** build.
 >
+> Based on upstream **v0.1.11**. The fork's patches and the upstream merge procedure are in [docs/operations/fork-maintenance.md](./docs/operations/fork-maintenance.md).
+>
 > **Install this fork (CLI):**
 >
 > macOS / Linux:

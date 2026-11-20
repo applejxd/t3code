@@ -1,0 +1,68 @@
+name: Publish installers
+
+# scripts/install.sh と install.ps1 を GitHub Pages (https://applejxd.github.io/t3code/) に出す。
+# README の `curl ... | sh` はこの URL を指す。stable への push で自動更新するので、手作業のコピーは要らない。
+# gh-pages ブランチへ GITHUB_TOKEN で push しても Pages のビルドは走らないので、ブランチ経由にはしない。
+# 一度だけ、Pages の Source を "GitHub Actions" にし、environment github-pages の許可ブランチに stable を足す
+# （手順は docs/operations/fork-maintenance.md）。
+
+on:
+  push:
+    branches: [stable]
+    paths:
+      - scripts/install.sh
+      - scripts/install.ps1
+      - .github/pages/**
+      - .github/workflows/publish-installers.yml
+  # 既定ブランチにこのファイルがあると Run workflow ボタンが出る。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # job の permissions は workflow の指定を置き換えるので、contents も書く。
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /scripts/install.sh
+            /scripts/install.ps1
+            /.github/pages/
+          sparse-checkout-cone-mode: false
+
+      # 壊れたスクリプトを `curl | sh` で配らない。
+      - name: Check install.sh syntax
+        run: sh -n scripts/install.sh
+
+      - name: Assemble site
+        run: |
+          mkdir _site
+          cp .github/pages/index.html scripts/install.sh scripts/install.ps1 _site/
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+      - id: deployment
+        name: Deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
