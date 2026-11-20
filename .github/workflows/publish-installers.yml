@@ -41,8 +41,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        # persist-credentials: false だと、checkout の認証削除が `git submodule foreach` を実行する。
+        # .gitmodules の無い gitlink（.repos/alchemy-effect/submodules/*。upstream 由来）で exit 128 になり落ちる。
+        # install.sh は構文検査だけを行い、配信するのは静的ファイルをコピーした _site だけなので、既定（true）のままにする。
         with:
-          persist-credentials: false
           sparse-checkout: |
             /scripts/install.sh
             /scripts/install.ps1
