@@ -77,16 +77,18 @@ fork の重複を消します。意図が反映されていなければ、新し
 - 意図: README の install コマンドが指す `https://applejxd.github.io/t3code/install.sh`・`install.ps1` を、
   手作業のコピーなしで `stable` と一致させます。`scripts/install.*` を `stable` に push すると、
   `.github/workflows/publish-installers.yml` が Pages に配信します。入口ページは `.github/pages/index.html` です。
-- 設定（一度だけ。この順に行います）:
+- 設定（一度だけ。この順に行います。applejxd/t3code は 2026-11-21 に実施し、配信を確認済みです）:
   1. Settings → Pages → Build and deployment → Source を「GitHub Actions」にします。
-  2. Settings → Environments → `github-pages` の Deployment branches and tags に `stable` を足します。今は
+  2. Settings → Environments → `github-pages` の Deployment branches and tags に `stable` を足します。初期状態では
      `gh-pages` だけが許可されていて、足さないと「Branch "stable" is not allowed to deploy to github-pages」で
      配信が失敗します。`gh api -X POST repos/applejxd/t3code/environments/github-pages/deployment-branch-policies -f name=stable -f type=branch`
      でも足せます。
   3. `stable` を push します（または Actions タブの Run workflow）。
 
-  切り替えから最初の配信が終わるまで、サイトが 404 になりえます。配信を確認できたら、`gh-pages`
-  ブランチと、環境の `gh-pages` のルールは削除してかまいません。
+  切り替えから最初の配信が終わるまで、サイトが 404 になりえます。配信後は、`gh-pages` ブランチと環境の
+  `gh-pages` のルールは使われません。削除してもかまいませんが、削除の影響は公式 docs に記載が見つからず未確認です。
+  削除したら `install.sh` を取得して確かめてください。消えていたら、workflow を再実行すれば再配信できます
+  （公式 docs: 成功した workflow run が新しい deployment を作ります）。
 
 - ブランチ経由にしない理由: 公式 docs に「GITHUB_TOKEN を使う workflow が push したコミットは、Pages の
   ビルドを起動しない」とあります
