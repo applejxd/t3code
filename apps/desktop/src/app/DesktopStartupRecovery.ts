@@ -1,4 +1,5 @@
 import type { DesktopUpdateState } from "@t3tools/contracts";
+import { CLI_RELEASES_PAGE_URL } from "@t3tools/shared/cliRelease";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -21,6 +22,9 @@ import * as DesktopObservability from "./DesktopObservability.ts";
 import * as DesktopState from "./DesktopState.ts";
 
 const RELEASES_URL = "https://github.com/pingdotgg/t3code/releases";
+// A fork version (x.y.z-fork.n) has release tags only in the fork, every other version only upstream.
+const releasesUrlFor = (version: string) =>
+  /-fork\.\d+$/u.test(version) ? CLI_RELEASES_PAGE_URL : RELEASES_URL;
 const LAST_STARTED_VERSION_FILE = "desktop-last-started-version";
 // Buttons are plain links to this host; will-navigate cancels them and runs the action.
 const ACTION_ORIGIN = "https://startup-recovery.invalid";
@@ -257,11 +261,13 @@ export const listen: Effect.Effect<
       }
       case "reinstall":
         if (current._tag === "Reinstall") {
-          yield* electronShell.openExternal(`${RELEASES_URL}/tag/v${current.version}`);
+          yield* electronShell.openExternal(
+            `${releasesUrlFor(current.version)}/tag/v${current.version}`,
+          );
         }
         return;
       case "releases":
-        yield* electronShell.openExternal(RELEASES_URL);
+        yield* electronShell.openExternal(releasesUrlFor(environment.appVersion));
         return;
       case "copy": {
         const failure = yield* Ref.get(failureRef);

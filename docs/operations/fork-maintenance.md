@@ -97,6 +97,19 @@ fork の重複を消します。意図が反映されていなければ、新し
 
 `88731dc3` と `7f289e8e` は、Actions の workflow 索引を促すだけの空コミットです。
 
+### 8. 起動失敗の回復画面の Releases リンクが、fork の版では fork を指す
+
+- 意図: デスクトップが起動に失敗したときの回復画面の「Releases」と「再インストール」のリンクを、fork の版（`x.y.z-fork.n`）では
+  fork のリリースへ向けます。upstream のままだと、fork の版のタグ `v<版>` が upstream に無く、404 になります。
+  それ以外の版（upstream の素の版、nightly、preview）は、従来どおり upstream を指します。直前に起動した版は、ユーザーデータに
+  配布元の区別なく記録されるので、upstream のビルドから乗り換えた直後でも、再インストール先が切れません。
+- 場所: `apps/desktop/src/app/DesktopStartupRecovery.ts` の `releasesUrlFor`。fork のリリースページは、パッチ 4 の
+  `packages/shared/src/cliRelease.ts`（`CLI_RELEASES_PAGE_URL`）を使い、リポジトリ名の書き場所を 1 つにします。
+- 取り込み時: upstream が回復画面のリンクの書き方を変えたら、同じ意図で直します。
+  `apps/web/src/components/desktopUpdate.logic.ts` の既定の `pingdotgg/t3code` は、変えていません。ビルド時に有効な
+  `owner/repo`（`T3CODE_DESKTOP_UPDATE_REPOSITORY`、無ければ `GITHUB_REPOSITORY`）が設定されていれば、使われません。fork の
+  CI では `GITHUB_REPOSITORY` が自動で `applejxd/t3code` になるので、fork を指すはずです（実際のビルドでは未確認）。
+
 ## upstream の取り込み手順
 
 定期実行（T3 の scheduled task）は、この手順に従います。束縛したスレッドへ、実行ごとに新しいセッションで投稿されます。
