@@ -39,6 +39,7 @@ fork の重複を消します。意図が反映されていなければ、新し
   インストーラを GitHub Release に出します。タグは `v<base>-fork.<n>` です。upstream は `-nightly.` と
   `-preview.` しか付けないので、タグが衝突しません。
 - 場所: `.github/workflows/release-fork.yml`。Windows のビルドは `release-desktop.yml` を変更せずに呼びます。
+  普段は無効にしてあり、リリースのときだけ有効にします（[fork のリリース手順](#fork-のリリース手順)）。
 - 取り込み時: `release-desktop.yml` やビルドスクリプトが変わったら、fork の workflow が渡す入力が合っているか
   確認します。
 
@@ -150,7 +151,8 @@ worktree と枝（`t3/merge-upstream-tag-into-stable`）は実行をまたいで
    push もしません。必要なものは、報告の最後で案内します。
    - 本体で `vp i` を実行します。
    - `scripts/install.*` が変わっていれば、`git push origin stable` で `publish-installers.yml` が Pages に配信します。
-   - リリースするときは `v<base>-fork.<n>` のタグを push します（`release-fork.yml` が走ります）。
+   - リリースするときは、[fork のリリース手順](#fork-のリリース手順)に従います。`release-fork.yml` は無効にしてあるので、
+     タグを push しても走りません。
 
    枝は、統合のマージコミット分だけ `stable` より古くなります。次の実行が手順 4 で追いつかせます。
 
@@ -190,3 +192,76 @@ worktree と枝（`t3/merge-upstream-tag-into-stable`）は実行をまたいで
   node を `/usr/bin` の外（mise など）に入れた機では `exec: node: not found` で落ちます。マージとは無関係です。
   - `archive launch script > a reconnect from an older client keeps a newer managed server running`
   - `archive launch script > a newer client still replaces an older managed server`
+
+## fork のリリース手順
+
+`v<base>-fork.<n>`（例: `v0.1.11-fork.1`）を GitHub Release に出す手順です。`release-fork.yml` が、CLI アーカイブ 3 つ、
+Windows CLI zip、`SHA256SUMS`、署名なしの Windows x64 インストーラ（`.blockmap` と `latest.yml` を含めて 8 ファイル）を作ります。
+
+- **`release-fork.yml` は、普段は無効にしておきます**（GitHub 上の設定で、状態は `disabled_manually`）。無効のまま起動すると
+  `HTTP 422: Cannot trigger a 'workflow_dispatch' on a disabled workflow` で失敗します。誰が・なぜ無効にしたかの記録は
+  ありません。v0.1.10 と v0.1.11 は、どちらも「下見の間だけ有効にし、公開は無効のまま」という流れで出しました。
+- **CI は `stable` では走りません**（`ci.yml` は PR と `main` への push だけ）。下見ビルドが、取り込んだコードを全プラットフォームで
+  ビルドして確かめる、唯一の機会です。
+- **draft は `install.sh` と `install.ps1` から見えません**（どちらも draft を除外します）。GitHub の「latest」にも入りません
+  （`make_latest: false`）。
+
+次の `R`、`V` を使います。`V` は先頭の `v` を付けない版です。
+
+```sh
+R=applejxd/t3code; V=0.1.11-fork.1
+```
+
+1. **前提を確かめます**。`stable` を push 済みで、同じ版のタグ・リリース・draft が無く、実行中の run が無いことが条件です。
+   同じ版は、タグ push と dispatch で並行実行のキーが違うので、排他されません。
+
+   ```sh
+   gh api repos/$R/branches/stable --jq .commit.sha                  # git rev-parse stable と一致
+   gh api repos/$R/git/matching-refs/tags/v$V --jq length            # 0
+   gh api repos/$R/releases --jq "[.[] | select(.tag_name==\"v$V\")] | length"   # 0
+   gh run list -R $R --workflow release-fork.yml --limit 5 --json status --jq '[.[] | select(.status!="completed")] | length'   # 0
+   ```
+
+2. **下見ビルド（draft、タグなし）**: 有効にして起動し、完了を待ってから、無効に戻します。
+
+   ```sh
+   gh workflow enable  release-fork.yml -R $R
+   gh workflow run     release-fork.yml -R $R --ref stable -f version=$V -f draft=true
+   gh run list -R $R --workflow release-fork.yml --limit 1           # 完了まで約 12〜30 分
+   gh workflow disable release-fork.yml -R $R                        # 完了後
+   ```
+
+   有効な間は、`v*-fork.*` のタグを push しないでください（ビルドが走ります）。run が実行中のまま無効にした場合の挙動は
+   未確認です（v0.1.11 では、完了の約 1 分前に無効にしても、run は最後まで成功しました）。
+
+3. **確かめます**: run の全 job が success で、draft に 8 ファイルがあること。
+
+   ```sh
+   gh release view v$V -R $R --json isDraft,assets --jq '{isDraft, assets: [.assets[].name]}'
+   ```
+
+   成果物は `t3-<V>-{darwin-arm64,linux-arm64,linux-x64}.tar.gz`、`t3-<V>-win32-x64.zip`、`T3-Code-<V>-x64.exe`
+   （と `.blockmap`）、`latest.yml`、`SHA256SUMS` です。動作は、Linux x64 のアーカイブを取得して見られます。
+   `sha256sum -c --ignore-missing SHA256SUMS` が OK で、`./t3 --version` が `t3 v<V>` と出れば十分です。
+
+4. **公開します**（workflow は無効のまま）: Releases ページの「Publish release」、または次のコマンド（未検証）です。
+   公開で、タグ `v<V>` が、下見をしたコミットに作られます。
+
+   ```sh
+   gh release edit v$V -R $R --draft=false --latest
+   ```
+
+   有効のまま公開すると、タグの作成でビルドが再び走るおそれがあります（有効のときの挙動は未確認です。v0.1.10 と
+   v0.1.11 は無効のまま公開し、再ビルドは走りませんでした）。
+
+5. **公開後に確かめます**:
+
+   ```sh
+   gh api repos/$R/releases/latest --jq .tag_name                    # v<V>
+   gh api repos/$R/git/ref/tags/v$V --jq '.object.sha[0:8]'          # 下見をしたコミット
+   ```
+
+6. **やめるとき**: draft を削除します（`gh release delete v$V -R $R`）。タグは作られていないので、他の片付けは要りません。
+
+下見を飛ばして、有効にしてからタグを push する方法もあります。ビルドが終わると、すぐ公開されて「latest」になります。
+取り消しに手間がかかるので、使いません。
