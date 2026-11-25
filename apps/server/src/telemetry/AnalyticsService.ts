@@ -96,7 +96,8 @@ export class AnalyticsService extends Context.Service<
      * per server process, so reconnects and repeated reads are free.
      */
     readonly recordOwners: (
-      owners: ReadonlyArray<TelemetryOwner>,
+      // An effect is run only while telemetry is on, so it can read provider login files.
+      owners: ReadonlyArray<TelemetryOwner> | Effect.Effect<ReadonlyArray<TelemetryOwner>>,
       observedBy: "server" | "client",
     ) => Effect.Effect<void>;
   }
@@ -147,7 +148,22 @@ export const make = Effect.gen(function* () {
   });
   const httpClient = yield* HttpClient.HttpClient;
   const serverConfig = yield* ServerConfig.ServerConfig;
-  const { distinctId, installId } = yield* getTelemetryIdentity;
+  // The identity reads provider login files, so resolve it only once telemetry is on.
+  const identityServices = yield* Effect.context<Effect.Services<typeof getTelemetryIdentity>>();
+  const telemetryIdentity = yield* Effect.cached(
+    getTelemetryIdentity.pipe(
+      Effect.provideContext(identityServices),
+      // A null distinctId disables telemetry; `cached` would otherwise replay a defect to every caller.
+      Effect.catchDefect(() =>
+        Effect.logWarning("Failed to resolve the telemetry identity; not sending telemetry").pipe(
+          Effect.as({ distinctId: null, installId: null }),
+        ),
+      ),
+    ),
+  );
+  // Resolve it at startup when telemetry is already on, as before. Otherwise a sender does it later,
+  // so no request waits on the login-file reads.
+  if (policyAllows && !awaitingShellConsent && telemetryConfig.enabled) yield* telemetryIdentity;
   const crypto = yield* SecureRandom.SecureRandom;
   const bufferRef = yield* Ref.make<ReadonlyArray<BufferedAnalyticsEvent>>([]);
   const deliveryRef = yield* Ref.make<DeliveryState>({
@@ -160,6 +176,12 @@ export const make = Effect.gen(function* () {
   const recordedOwnersRef = yield* Ref.make<
     Readonly<Record<"server" | "client", ReadonlySet<string>>>
   >({ server: new Set(), client: new Set() });
+  const pendingOwnersRef = yield* Ref.make<
+    ReadonlyArray<{
+      readonly owners: Effect.Effect<ReadonlyArray<TelemetryOwner>>;
+      readonly observedBy: "server" | "client";
+    }>
+  >([]);
   // The background flush and the shutdown flush must not send the same batch at once.
   const flushLock = yield* Semaphore.make(1);
   const clientType = serverConfig.mode === "desktop" ? "desktop-app" : "cli-web-client";
@@ -201,7 +223,10 @@ export const make = Effect.gen(function* () {
   const sendBatch = Effect.fn("AnalyticsService.sendBatch")(function* (
     events: ReadonlyArray<BufferedAnalyticsEvent>,
   ) {
-    if (!(yield* telemetryEnabled) || !distinctId) return;
+    if (!(yield* telemetryEnabled)) return;
+    const { distinctId, installId } = yield* telemetryIdentity.pipe(Effect.timeout(SEND_TIMEOUT));
+    // Consent can change while the identity is read.
+    if (!distinctId || !(yield* telemetryEnabled)) return;
 
     const payload = {
       api_key: telemetryConfig.posthogKey,
@@ -313,7 +338,7 @@ export const make = Effect.gen(function* () {
 
   const record: AnalyticsService["Service"]["record"] = Effect.fn("AnalyticsService.record")(
     function* (event, properties) {
-      if (!(yield* telemetryEnabled) || !distinctId) return;
+      if (!(yield* telemetryEnabled)) return;
 
       // Catch Node UUID defects too; best-effort telemetry drops events without UUIDs.
       const uuid = yield* Effect.exit(crypto.uuidV7());
@@ -331,9 +356,17 @@ export const make = Effect.gen(function* () {
 
   const recordOwners: AnalyticsService["Service"]["recordOwners"] = Effect.fn(
     "AnalyticsService.recordOwners",
-  )((owners, observedBy) =>
-    Effect.forEach(
-      owners,
+  )(function* (owners, observedBy) {
+    if (Effect.isEffect(owners) && !(yield* telemetryEnabled)) {
+      // Desktop consent can arrive after startup, so retry the read on a later flush tick.
+      if (awaitingShellConsent && policyAllows) {
+        yield* Ref.update(pendingOwnersRef, (pending) => [...pending, { owners, observedBy }]);
+      }
+      return;
+    }
+    const resolved = Effect.isEffect(owners) ? yield* owners : owners;
+    yield* Effect.forEach(
+      resolved,
       ({ source, ownerId }) =>
         Ref.modify(recordedOwnersRef, (recorded) => {
           const key = `${source}:${ownerId}`;
@@ -349,12 +382,30 @@ export const make = Effect.gen(function* () {
           ),
         ),
       { discard: true },
-    ),
-  );
+    );
+  });
+
+  const recordPendingOwners = Effect.gen(function* () {
+    if ((yield* Ref.get(pendingOwnersRef)).length === 0 || !(yield* telemetryEnabled)) return;
+    const pending = yield* Ref.getAndSet(pendingOwnersRef, []);
+    yield* Effect.forEach(pending, ({ owners, observedBy }) => recordOwners(owners, observedBy), {
+      discard: true,
+    });
+  });
 
   yield* Effect.forever(Effect.sleep(FLUSH_INTERVAL_MS).pipe(Effect.andThen(flushWhenDue)), {
     disableYield: true,
   }).pipe(Effect.forkScoped);
+
+  // Apart from the flush loop, so a stuck owner read cannot stop delivery.
+  if (awaitingShellConsent) {
+    yield* Effect.forever(
+      Effect.sleep(FLUSH_INTERVAL_MS).pipe(
+        Effect.andThen(recordPendingOwners.pipe(Effect.timeout(SEND_TIMEOUT), Effect.ignoreCause)),
+      ),
+      { disableYield: true },
+    ).pipe(Effect.forkScoped);
+  }
 
   yield* Effect.addFinalizer(() =>
     flush.pipe(Effect.timeout(SHUTDOWN_FLUSH_TIMEOUT), Effect.ignore),

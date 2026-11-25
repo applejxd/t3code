@@ -3,10 +3,13 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -106,6 +109,8 @@ const failingFor = (minutes: number) => {
   return { respond, answers };
 };
 
+const FLUSH_INTERVAL = "10 seconds";
+
 const recordTwentyEvents = Effect.gen(function* () {
   const analytics = yield* AnalyticsService.AnalyticsService;
   for (let index = 0; index < 20; index += 1) {
@@ -117,6 +122,7 @@ const analyticsLayerWith = (
   client: HttpClient.HttpClient,
   policy?: ManagedPolicyDocument,
   startupConfig: Record<string, unknown> = { T3CODE_TELEMETRY_ENABLED: true },
+  hostOverrides: Layer.Layer<never, never, FileSystem.FileSystem> = Layer.empty,
 ) =>
   AnalyticsService.layer.pipe(
     Layer.provideMerge(
@@ -139,6 +145,7 @@ const analyticsLayerWith = (
         ManagedPolicy.layerTest(policy),
       ),
     ),
+    Layer.provide(hostOverrides),
   );
 
 /**
@@ -156,6 +163,7 @@ const sendFor = (
   > = recordTwentyEvents,
   policy?: ManagedPolicyDocument,
   startupConfig?: Record<string, unknown>,
+  hostOverrides?: Layer.Layer<never, never, FileSystem.FileSystem>,
 ) =>
   Effect.gen(function* () {
     const batches: Array<ReadonlyArray<SentEvent>> = [];
@@ -170,7 +178,7 @@ const sendFor = (
         return yield* respond(request);
       }),
     );
-    const runtimeLayer = analyticsLayerWith(client, policy, startupConfig);
+    const runtimeLayer = analyticsLayerWith(client, policy, startupConfig, hostOverrides);
 
     yield* Effect.gen(function* () {
       yield* record;
@@ -235,6 +243,214 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("AnalyticsService
           batches.flat().map((event) => event.event),
           sent,
         );
+      }),
+  );
+
+  it.effect.each([
+    { name: "off", startupConfig: {}, resolvesIdentity: false },
+    { name: "on", startupConfig: { T3CODE_TELEMETRY_ENABLED: true }, resolvesIdentity: true },
+  ])(
+    "reads provider login files and server owners only while telemetry is $name",
+    ({ startupConfig, resolvesIdentity }) =>
+      Effect.gen(function* () {
+        const home = "/tmp/t3-telemetry-test-home";
+        const reads: Array<string> = [];
+        const hostOverrides = Layer.mergeAll(
+          Layer.succeed(HostProcess.HomeDirectory, home),
+          Layer.effect(
+            FileSystem.FileSystem,
+            Effect.map(FileSystem.FileSystem, (fileSystem) => ({
+              ...fileSystem,
+              readFileString: (path: string, encoding?: string) => {
+                reads.push(path);
+                return fileSystem.readFileString(path, encoding);
+              },
+            })),
+          ),
+        );
+        let anonymousIdCreated: boolean | undefined;
+        let ownersResolved = false;
+        const batches = yield* sendFor(
+          0,
+          respondWithStatus(204),
+          Effect.gen(function* () {
+            const analytics = yield* AnalyticsService.AnalyticsService;
+            const { anonymousIdPath } = yield* ServerConfig.ServerConfig;
+            const fileSystem = yield* FileSystem.FileSystem;
+            yield* analytics.record("test.identity");
+            yield* analytics.recordOwners(
+              Effect.sync(() => {
+                ownersResolved = true;
+                return [{ source: "connect" as const, ownerId: "a".repeat(64) }];
+              }),
+              "server",
+            );
+            yield* analytics.flush;
+            // The anonymous id is written by the same identity lookup that reads the login files.
+            anonymousIdCreated = yield* fileSystem.exists(anonymousIdPath).pipe(Effect.orDie);
+          }),
+          undefined,
+          startupConfig,
+          hostOverrides,
+        );
+        assert.deepEqual(
+          reads.filter((path) => path.startsWith(home)),
+          resolvesIdentity ? [`${home}/.codex/auth.json`, `${home}/.claude.json`] : [],
+        );
+        assert.equal(anonymousIdCreated, resolvesIdentity);
+        assert.equal(ownersResolved, resolvesIdentity);
+        assert.deepEqual(
+          batches.flat().map((event) => event.event),
+          resolvesIdentity ? ["test.identity", "install.owner_observed"] : [],
+        );
+      }),
+  );
+
+  it.effect(
+    "a server owner read held back by desktop shell consent runs once consent arrives",
+    () =>
+      Effect.gen(function* () {
+        const env: NodeJS.ProcessEnv = { T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING: "1" };
+        let ownerReads = 0;
+        const batches = yield* sendFor(
+          1,
+          respondWithStatus(204),
+          Effect.gen(function* () {
+            const analytics = yield* AnalyticsService.AnalyticsService;
+            yield* analytics.recordOwners(
+              Effect.sync(() => {
+                ownerReads += 1;
+                return [{ source: "connect" as const, ownerId: "b".repeat(64) }];
+              }),
+              "server",
+            );
+            assert.equal(ownerReads, 0);
+            env.T3CODE_TELEMETRY_ENABLED = "true";
+            delete env.T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING;
+            const { anonymousIdPath } = yield* ServerConfig.ServerConfig;
+            const fileSystem = yield* FileSystem.FileSystem;
+            const identityResolved = fileSystem.exists(anonymousIdPath).pipe(Effect.orDie);
+            yield* analytics.record("test.consent");
+            // Recording never waits on the login-file reads; the first send does them.
+            assert.isFalse(yield* identityResolved);
+            // Resolved here so the flush fiber, which would not wait for file I/O under the test clock, finds it.
+            yield* analytics.flush;
+            assert.isTrue(yield* identityResolved);
+            assert.equal(ownerReads, 0);
+          }),
+          undefined,
+          {},
+        ).pipe(Effect.provideService(HostProcess.Environment, env));
+        assert.equal(ownerReads, 1);
+        assert.deepEqual(
+          batches.flat().map((event) => event.event),
+          ["test.consent", "install.owner_observed"],
+        );
+      }),
+  );
+
+  it.effect("sends nothing when telemetry is turned off while the identity is being resolved", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING: "1" };
+      const secureRandom = yield* SecureRandom.SecureRandom;
+      const resolving = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const batches = yield* sendFor(
+        0,
+        respondWithStatus(204),
+        Effect.gen(function* () {
+          const analytics = yield* AnalyticsService.AnalyticsService;
+          env.T3CODE_TELEMETRY_ENABLED = "true";
+          delete env.T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING;
+          yield* analytics.record("test.event");
+          const flushing = yield* analytics.flush.pipe(Effect.forkChild);
+          yield* Deferred.await(resolving);
+          env.T3CODE_TELEMETRY_ENABLED = "false";
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(flushing);
+        }),
+        undefined,
+        {},
+      ).pipe(
+        Effect.provideService(HostProcess.Environment, env),
+        Effect.provideService(SecureRandom.SecureRandom, {
+          ...secureRandom,
+          uuidV4: () =>
+            Deferred.succeed(resolving, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(secureRandom.uuidV4()),
+            ),
+        }),
+      );
+      assert.deepEqual(batches, []);
+    }),
+  );
+
+  it.effect("a failing server owner read does not stop periodic delivery", () =>
+    Effect.gen(function* () {
+      const env: NodeJS.ProcessEnv = { T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING: "1" };
+      const sentAt: Array<number> = [];
+      const ownerRead = yield* Deferred.make<void>();
+      const batches = yield* sendFor(
+        1,
+        (request) =>
+          Effect.flatMap(Clock.currentTimeMillis, (now) => {
+            sentAt.push(now);
+            return respondWithStatus(204)(request);
+          }),
+        Effect.gen(function* () {
+          const analytics = yield* AnalyticsService.AnalyticsService;
+          yield* analytics.recordOwners(
+            Deferred.succeed(ownerRead, undefined).pipe(Effect.andThen(Effect.die("unreadable"))),
+            "server",
+          );
+          env.T3CODE_TELEMETRY_ENABLED = "true";
+          delete env.T3CODE_DESKTOP_SHELL_DISCOVERY_PENDING;
+          // Resolves the identity here: under the test clock the flush fiber would not wait for its file I/O.
+          yield* analytics.record("test.consent");
+          yield* analytics.flush;
+          // The next tick runs the held-back owner read, which fails; only then is the event recorded.
+          yield* TestClock.adjust(FLUSH_INTERVAL);
+          yield* Deferred.await(ownerRead);
+          yield* analytics.record("test.after");
+        }),
+        undefined,
+        {},
+      ).pipe(Effect.provideService(HostProcess.Environment, env));
+      assert.deepEqual(
+        batches.flat().map((event) => event.event),
+        ["test.consent", "test.after"],
+      );
+      // The background loop sends it, not the flush when the scope closes at the end of the minute.
+      assert.isBelow((sentAt.at(-1) ?? Infinity) - (sentAt[0] ?? 0), 60_000);
+    }),
+  );
+
+  it.effect(
+    "a defect while resolving the identity turns telemetry off instead of failing callers",
+    () =>
+      Effect.gen(function* () {
+        const secureRandom = yield* SecureRandom.SecureRandom;
+        let uuidV4Calls = 0;
+        const batches = yield* sendFor(
+          0,
+          respondWithStatus(204),
+          Effect.gen(function* () {
+            const analytics = yield* AnalyticsService.AnalyticsService;
+            yield* analytics.record("test.first");
+            yield* analytics.record("test.second");
+            yield* analytics.flush;
+          }),
+        ).pipe(
+          Effect.provideService(SecureRandom.SecureRandom, {
+            ...secureRandom,
+            uuidV4: () =>
+              Effect.sync(() => (uuidV4Calls += 1)).pipe(Effect.andThen(Effect.die("no entropy"))),
+          }),
+        );
+        assert.deepEqual(batches, []);
+        // The failed lookup is remembered, not retried for each event.
+        assert.equal(uuidV4Calls, 1);
       }),
   );
 

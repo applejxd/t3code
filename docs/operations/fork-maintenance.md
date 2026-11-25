@@ -117,11 +117,22 @@ fork の重複を消します。意図が反映されていなければ、新し
   環境に頼らず、コードの既定を OFF にします。これを主たる防御とし、`T3CODE_TELEMETRY_ENABLED=false` は補助です。
   `T3CODE_TELEMETRY_ENABLED=true`（`Config.Boolean` が受け付ける `yes`・`on`・`1`・`y` も同じ）で従来どおり送ります
   （dev サーバでの試験用）。managed policy の `limits.telemetry=false` は有効化より優先します（upstream のまま）。
+- テレメトリ目的の読み取りも、無効の間は止めます。upstream は起動時に無条件で `~/.codex/auth.json`・`~/.claude.json` と、
+  secret store の Connect ユーザー ID を読み、`account_id`、`id_token` の `user_id`、`accountUuid`、Connect のユーザー ID
+  （と、マシンごとの `userID`）を SHA-256 にして、`distinct_id` と `install.owner_observed` に使います。fork では、識別子
+  （匿名 ID ファイルの作成を含む）を、起動時に有効なら起動時に（upstream と同じ）、そうでなければ最初の送信のときに解決し、
+  完了した結果をキャッシュします（`Effect.cached`。タイムアウトした解決は、バックオフの後の送信でやり直します）。
+  解決の間に無効へ切り替わったときは、解決の後に有効かどうかをもう一度確かめ、送りません。`record` と接続の処理は、識別子の読み取りを待ちません。解決中の defect は、警告を出して識別子を
+  null にし、送信しません（型付きのエラーは upstream どおり、匿名 ID が `null` になるだけです）。起動時のサーバの owner 読み取りは、
+  `recordOwners` が Effect を受け取り、有効なときだけ実行します。デスクトップの確認待ちの間は保留し、確認後に opt-in が有効なら、
+  flush とは別のループ（10 秒周期、タイムアウト付き）で 1 回実行します。provider 自体の認証や、Connect の復旧など
+  テレメトリ以外の読み取りは対象外です。トークン本体は、upstream でも送っていません。
 - 効く範囲: このパッチを含む版を入れて、サービスを再起動してから効きます。入れる前の版（`0.1.10-fork.1` など）は既定 ON のままです。
 - 場所: `apps/server/src/telemetry/AnalyticsService.ts`（`TelemetryEnvConfig.enabled` と、デスクトップのシェル確認後の読み直しの
-  2 か所の `Config.withDefault(false)`。確認待ちの間は起動時の値を使わず、確認後の環境で判定します）、
+  2 か所の `Config.withDefault(false)`。確認待ちの間は起動時の値を使わず、確認後の環境で判定します。識別子の遅延解決と
+  `recordOwners` も同じファイルです）、`apps/server/src/serverRuntimeStartup.ts`（owner 読み取りを Effect のまま渡す）、
   `packages/shared/src/otelEnvironment.ts` の `isRelayTracingEnabled`（`telemetry.value === true`）。テストは
-  `AnalyticsService.test.ts`（「not opted in」の行と、デスクトップの確認後の opt-in）、`otelEnvironment.test.ts`、
+  `AnalyticsService.test.ts`（「not opted in」の行、デスクトップの確認後の opt-in、無効の間に認証情報を読まないこと）、`otelEnvironment.test.ts`、
   `apps/desktop/src/ipc/methods/window.test.ts`。
 - 挙動の差: デスクトップの画面（renderer）の relay トレースは、最初の問い合わせの時点でプロセスの環境が opt-in していなければ
   `false` を返し、renderer はそれを保持します（以後に login シェルが opt-in しても変わりません）。それ以前にシェル探索が
