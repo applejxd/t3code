@@ -110,6 +110,30 @@ fork の重複を消します。意図が反映されていなければ、新し
   `owner/repo`（`T3CODE_DESKTOP_UPDATE_REPOSITORY`、無ければ `GITHUB_REPOSITORY`）が設定されていれば、使われません。fork の
   CI では `GITHUB_REPOSITORY` が自動で `applejxd/t3code` になるので、fork を指すはずです（実際のビルドでは未確認）。
 
+### 9. テレメトリは既定 OFF（opt-in）
+
+- 意図: upstream は、製品利用イベント（`ingest.t3.codes` 経由で PostHog へ）と relay トレースを既定 ON で送り、止めるには
+  `T3CODE_TELEMETRY_ENABLED=false` を環境に置く必要があります。systemd の背景サービスは環境変数を読まないことがあるので、
+  環境に頼らず、コードの既定を OFF にします。これを主たる防御とし、`T3CODE_TELEMETRY_ENABLED=false` は補助です。
+  `T3CODE_TELEMETRY_ENABLED=true`（`Config.Boolean` が受け付ける `yes`・`on`・`1`・`y` も同じ）で従来どおり送ります
+  （dev サーバでの試験用）。managed policy の `limits.telemetry=false` は有効化より優先します（upstream のまま）。
+- 効く範囲: このパッチを含む版を入れて、サービスを再起動してから効きます。入れる前の版（`0.1.10-fork.1` など）は既定 ON のままです。
+- 場所: `apps/server/src/telemetry/AnalyticsService.ts`（`TelemetryEnvConfig.enabled` と、デスクトップのシェル確認後の読み直しの
+  2 か所の `Config.withDefault(false)`。確認待ちの間は起動時の値を使わず、確認後の環境で判定します）、
+  `packages/shared/src/otelEnvironment.ts` の `isRelayTracingEnabled`（`telemetry.value === true`）。テストは
+  `AnalyticsService.test.ts`（「not opted in」の行と、デスクトップの確認後の opt-in）、`otelEnvironment.test.ts`、
+  `apps/desktop/src/ipc/methods/window.test.ts`。
+- 挙動の差: デスクトップの画面（renderer）の relay トレースは、最初の問い合わせの時点でプロセスの環境が opt-in していなければ
+  `false` を返し、renderer はそれを保持します（以後に login シェルが opt-in しても変わりません）。それ以前にシェル探索が
+  opt-in をプロセスの環境へ入れていれば有効になります。opt-in していて探索が未完了のときは、upstream どおり `null` を返します。
+- 止まらないもの: ブラウザ版は環境変数も policy も読みません。ただし relay トレースの URL・dataset・token を持つビルドだけが送り、
+  fork の CI はこれらを埋め込みません（`release-fork.yml` を読んで確認。実際の成果物は未確認）。mobile のクラッシュ報告、
+  `Publish agent activity` は別の経路です。UI の「collects anonymous usage data」の文言と `docs/user/telemetry.md` は
+  upstream のままです（i18n 全言語に及ぶため直しません）。
+- 取り込み時: upstream がこれらの既定値や `isRelayTracingEnabled` を変えたら、同じ意図（既定 OFF）で当て直します。
+  upstream が opt-in 化していたら、fork の変更を消します。`T3CODE_TELEMETRY_ENABLED` 未設定で ON を前提にする新しいテストは、
+  `true` を明示して直します。
+
 ## upstream の取り込み手順
 
 定期実行（T3 の scheduled task）は、この手順に従います。束縛したスレッドへ、実行ごとに新しいセッションで投稿されます。
